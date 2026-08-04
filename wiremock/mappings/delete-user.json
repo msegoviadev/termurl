@@ -1,0 +1,14 @@
+{
+  "request": {
+    "method": "DELETE",
+    "urlPath": "/users/42",
+    "headers": {
+      "Authorization": {
+        "equalTo": "Bearer dev-token"
+      }
+    }
+  },
+  "response": {
+    "status": 204
+  }
+}

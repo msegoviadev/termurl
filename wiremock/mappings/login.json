@@ -1,0 +1,16 @@
+{
+  "request": {
+    "method": "POST",
+    "urlPath": "/auth/login"
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "jsonBody": {
+      "token": "dev-token",
+      "refresh_token": "dev-refresh-token"
+    }
+  }
+}
