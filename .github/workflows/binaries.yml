@@ -1,0 +1,189 @@
+name: Build Standalone Binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build, for example v0.1.0"
+        required: true
+        type: string
+  repository_dispatch:
+    types: [build-binaries]
+
+permissions:
+  contents: read
+
+env:
+  TAG: ${{ inputs.tag || github.event.client_payload.tag }}
+
+jobs:
+  build:
+    name: Build ${{ matrix.asset }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: bun-darwin-arm64
+            asset: termurl-darwin-arm64
+            os: darwin
+            cpu: arm64
+          - target: bun-darwin-x64
+            asset: termurl-darwin-x64
+            os: darwin
+            cpu: x64
+          - target: bun-linux-arm64
+            asset: termurl-linux-arm64
+            os: linux
+            cpu: arm64
+          - target: bun-linux-x64
+            asset: termurl-linux-x64
+            os: linux
+            cpu: x64
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Check release version
+        run: test "v$(jq -r .version package.json)" = "$TAG"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile --os=${{ matrix.os }} --cpu=${{ matrix.cpu }}
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Build binary
+        run: bun build --compile --target=${{ matrix.target }} --outfile=${{ matrix.asset }} index.ts
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+          retention-days: 1
+
+  smoke-linux:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: termurl-linux-x64
+          path: dist
+
+      - name: Make binary executable
+        run: chmod +x dist/termurl-linux-x64
+
+      - name: Smoke test linux-x64
+        run: test "$(dist/termurl-linux-x64 --version)" = "${TAG#v}"
+
+  publish-binaries:
+    needs: [build, smoke-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Make binaries executable
+        run: chmod +x dist/termurl-*
+
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum termurl-* > SHA256SUMS
+
+      - name: Upload binaries to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --generate-notes
+          fi
+
+  update-homebrew:
+    needs: publish-binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checkout Homebrew tap
+        uses: actions/checkout@v4
+        with:
+          repository: msegoviadev/homebrew-tap
+          token: ${{ secrets.PACKAGES_REPO_PAT }}
+          path: homebrew-tap
+
+      - name: Generate termurl formula
+        env:
+          VERSION: ${{ env.TAG }}
+        run: |
+          VERSION="${TAG#v}"
+          mkdir -p homebrew-tap/Formula
+          cat > homebrew-tap/Formula/termurl.rb <<EOF
+          class Termurl < Formula
+            desc "Terminal client for Hurl collections with an agent-friendly headless CLI"
+            homepage "https://github.com/msegoviadev/termurl"
+            version "${VERSION}"
+            license "MIT"
+            depends_on "hurl"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/msegoviadev/termurl/releases/download/v${VERSION}/termurl-darwin-arm64"
+                sha256 "$(sha256sum dist/termurl-darwin-arm64 | cut -d' ' -f1)"
+              end
+              on_intel do
+                url "https://github.com/msegoviadev/termurl/releases/download/v${VERSION}/termurl-darwin-x64"
+                sha256 "$(sha256sum dist/termurl-darwin-x64 | cut -d' ' -f1)"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "https://github.com/msegoviadev/termurl/releases/download/v${VERSION}/termurl-linux-arm64"
+                sha256 "$(sha256sum dist/termurl-linux-arm64 | cut -d' ' -f1)"
+              end
+              on_intel do
+                url "https://github.com/msegoviadev/termurl/releases/download/v${VERSION}/termurl-linux-x64"
+                sha256 "$(sha256sum dist/termurl-linux-x64 | cut -d' ' -f1)"
+              end
+            end
+
+            def install
+              binary_name = if OS.mac?
+                Hardware::CPU.arm? ? "termurl-darwin-arm64" : "termurl-darwin-x64"
+              else
+                Hardware::CPU.arm? ? "termurl-linux-arm64" : "termurl-linux-x64"
+              end
+              bin.install binary_name => "termurl"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/termurl --version")
+            end
+          end
+          EOF
+
+      - name: Commit and push formula
+        run: |
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/termurl.rb
+          git commit -m "Update termurl to ${TAG#v}" || echo "No changes to commit"
+          git push origin HEAD:main

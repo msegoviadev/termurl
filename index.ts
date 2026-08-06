@@ -8,13 +8,147 @@ import {
   SyntaxStyle,
   type KeyEvent,
 } from "@opentui/core";
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, readdirSync, statSync, rmSync } from "fs";
-import { join, relative } from "path";
-import { tmpdir } from "os";
+import packageJson from "./package.json" with { type: "json" };
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, readdirSync, statSync, rmSync } from "fs";
+import { join, relative, resolve } from "path";
+import { homedir, tmpdir } from "os";
+import * as readline from "node:readline/promises";
 
-const COLLECTION = new URL("./collection", import.meta.url).pathname;
+function parseVariables(src: string): Record<string, string> {
+  const variables: Record<string, string> = {};
+  for (const line of src.split(/\r?\n/)) {
+    const match = line.match(/^\s*([A-Za-z_]\w*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s#]*))?\s*(?:#.*)?$/);
+    if (match) variables[match[1]] = match[2] ?? match[3] ?? match[4] ?? "";
+  }
+  return variables;
+}
+
+function expandHome(path: string): string {
+  return path === "~" ? homedir() : path.startsWith("~/") ? join(homedir(), path.slice(2)) : path;
+}
+
+const CONFIG_DIR = join(process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"), "termurl");
+const CONFIG_FILE = join(CONFIG_DIR, "config.toml");
+const DEFAULT_COLLECTION = "~/collection";
+
+function loadConfig(): Record<string, string> {
+  try {
+    return parseVariables(readFileSync(CONFIG_FILE, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function cliArgs(): string[] {
+  const args = process.argv[1]?.endsWith(".ts") ? process.argv.slice(2) : process.argv.slice(1);
+  return args.filter((arg) => !arg.startsWith("/$bunfs/") && arg !== Bun.main);
+}
+
+function scaffoldCollection(dir: string) {
+  if (existsSync(dir) && readdirSync(dir).length > 0) return;
+  mkdirSync(join(dir, "httpbin"), { recursive: true });
+  writeFileSync(join(dir, ".env.dev"), "# dev environment variables\nhost=https://httpbin.org\n");
+  writeFileSync(join(dir, ".env.example"), "# Shared secrets for all environments (copy to .env, keep it out of version control)\n# token=secret-value\n");
+  writeFileSync(join(dir, "httpbin", "get.hurl"), "# Sample request\nGET {{host}}/get\nHTTP 200\n");
+}
+
+async function runInit(defaultPath: string, nonInteractive = false) {
+  if (existsSync(CONFIG_FILE)) {
+    console.log(`config already exists: ${CONFIG_FILE}`);
+    return;
+  }
+  let collectionPath: string;
+  if (nonInteractive) {
+    collectionPath = resolve(expandHome(defaultPath));
+  } else {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const answer = await rl.question(`termurl setup\nCollection path [${defaultPath}]: `);
+    rl.close();
+    collectionPath = resolve(expandHome(answer.trim() || defaultPath));
+  }
+  mkdirSync(CONFIG_DIR, { recursive: true });
+  writeFileSync(CONFIG_FILE, `# termurl configuration\ncollection = "${collectionPath}"\n`);
+  scaffoldCollection(collectionPath);
+  console.log(`config written: ${CONFIG_FILE}`);
+  console.log(`collection: ${collectionPath}`);
+  console.log("run `termurl` to start");
+}
+
+const args = cliArgs();
+const HEADLESS_COMMANDS = new Set(["doctor", "list", "show", "env", "run"]);
+const HELP = `termurl - a terminal client for hurl collections
+
+usage:
+  termurl [collection]                         open the interactive TUI
+  termurl init [path] [--yes]                  create config and a starter collection
+  termurl doctor [--json]                      check hurl, config, and collection setup
+  termurl list [--json]                        list requests
+  termurl show <request>                       print a request file
+  termurl env list [--json]                    list environments
+  termurl env show <name> [--reveal] [--json]  show environment variables
+  termurl run <request...> [options]            run requests in argument order
+  termurl --version                            print the version
+
+run options:
+  --env <name>     choose an environment
+  --var KEY=value  add a variable, repeatable
+  --json           print structured results to stdout
+  -q, --quiet      suppress the run report on stderr
+
+Exit codes: 0 success, 1 usage or configuration error, 2 runtime error, 3 assert failure.
+`;
+
+const hasFlag = (name: string) => args.includes(name);
+
+if (args[0] === "init") {
+  if (hasFlag("--help") || hasFlag("-h")) {
+    console.log("usage: termurl init [path] [--yes]");
+    process.exit(0);
+  }
+  await runInit(args.slice(1).find((arg) => !arg.startsWith("-")) ?? DEFAULT_COLLECTION, hasFlag("--yes"));
+  process.exit(0);
+}
+
+if (args[0] === "help" || hasFlag("--help") || hasFlag("-h")) {
+  console.log(HELP);
+  process.exit(0);
+}
+
+if (args[0] === "version" || hasFlag("--version")) {
+  console.log(packageJson.version);
+  process.exit(0);
+}
+
+const isDoctor = args[0] === "doctor";
+if (!HEADLESS_COMMANDS.has(args[0] ?? "") && (args.includes("--env") || args.some((arg) => arg.startsWith("--env=")) || args.includes("--json") || args.includes("--var") || args.some((arg) => arg.startsWith("--var=")))) {
+  console.error(`termurl: did you mean \`termurl run ${args.join(" ")}\`?`);
+  process.exit(1);
+}
+const cliCollection = HEADLESS_COMMANDS.has(args[0] ?? "") ? undefined : args.find((arg) => !arg.startsWith("-"));
+
+if (!isDoctor && !existsSync(CONFIG_FILE)) {
+  console.error(`termurl is not set up. Run \`termurl init\` to create ${CONFIG_FILE}`);
+  process.exit(1);
+}
+const CONFIG = loadConfig();
+const collectionSetting = isDoctor ? CONFIG.collection : cliCollection ?? CONFIG.collection;
+if (!isDoctor && !collectionSetting) {
+  console.error(`no collection configured. Set collection in ${CONFIG_FILE} or pass a collection path.`);
+  process.exit(1);
+}
+const COLLECTION = collectionSetting ? resolve(expandHome(collectionSetting)) : "";
+if (!isDoctor && (!existsSync(COLLECTION) || !statSync(COLLECTION).isDirectory())) {
+  const origin = cliCollection ? "passed as argument" : `set in ${CONFIG_FILE}`;
+  console.error(`collection not found: ${COLLECTION} (${origin}). Fix the path or delete the config and run \`termurl init\`.`);
+  process.exit(1);
+}
 const HISTORY_FILE = join(COLLECTION, ".termurl/history.jsonl");
-const PROFILE_FILE = join(COLLECTION, "termurl.toml");
+
+const requests = loadRequests();
+const environments = environmentNames();
+if (environments.length === 0) environments.push("dev");
+let environmentIdx = Math.max(0, environments.indexOf(CONFIG.environment ?? ""));
+let cliVariables: Record<string, string> = {};
 
 const C = {
   bg: "#1a1b26",
@@ -30,17 +164,23 @@ const C = {
 type Req = { name: string; file: string; desc: string; method: string; path: string; vars: string[] };
 
 function walk(dir: string): string[] {
-  return readdirSync(dir).flatMap((e) => {
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return [];
+  }
+  return entries.flatMap((e) => {
     const p = join(dir, e);
     return statSync(p).isDirectory() ? (e === ".termurl" ? [] : walk(p)) : e.endsWith(".hurl") ? [p] : [];
   });
 }
 
-function loadRequests(): Req[] {
-  return walk(COLLECTION)
+function loadRequests(collection = COLLECTION): Req[] {
+  return walk(collection)
     .map((file) => {
       const src = readFileSync(file, "utf8");
-      const name = relative(COLLECTION, file).replace(/\.hurl$/, "");
+      const name = relative(collection, file).replace(/\.hurl$/, "");
       const desc = src.match(/^# (.+)$/m)?.[1] ?? "";
       const reqLine = src.match(/^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS) (\S+)/m);
       const method = reqLine?.[1] ?? "?";
@@ -62,6 +202,7 @@ type RunResult = {
   ms: number;
   asserts: { passed: number; total: number };
   captures: string[];
+  captured: Record<string, string>;
   body: string;
   headers: string[];
   error?: string;
@@ -72,6 +213,7 @@ type HurlJson = {
   time?: number;
   entries?: Array<{
     asserts?: Array<{ success?: boolean; message?: string }>;
+    captures?: Array<{ name?: string; value?: string }>;
     calls?: Array<{
       response?: { status?: number; headers?: Array<{ name: string; value: string }> };
       timings?: { total?: number };
@@ -80,24 +222,39 @@ type HurlJson = {
   }>;
 };
 
-function profileVariables(profile: string): Record<string, string> {
-  const config = readFileSync(PROFILE_FILE, "utf8");
-  const variables: Record<string, string> = {};
-  const lines = config.split(/\r?\n/);
-  const sectionStart = lines.findIndex((line) => line.trim() === `[profiles.${profile}]`);
-  if (sectionStart < 0) return variables;
-  for (const line of lines.slice(sectionStart + 1)) {
-    if (/^\s*\[/.test(line)) break;
-    const match = line.match(/^([a-zA-Z_][\w-]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s#]+))\s*(?:#.*)?$/);
-    if (match) variables[match[1]] = match[2] ?? match[3] ?? match[4];
-  }
-  return variables;
+function environmentFile(name: string, collection = COLLECTION): string {
+  return join(collection, `.env.${name}`);
 }
 
-function profileNames(): string[] {
-  const config = readFileSync(PROFILE_FILE, "utf8");
-  const names = [...config.matchAll(/^\[profiles\.([^\]]+)\]$/gm)].map((match) => match[1]);
-  return names.length ? names : ["dev"];
+function environmentVariables(name: string, collection = COLLECTION): Record<string, string> {
+  try {
+    return parseVariables(readFileSync(environmentFile(name, collection), "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function secretVariables(collection = COLLECTION): Record<string, string> {
+  try {
+    return parseVariables(readFileSync(join(collection, ".env"), "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function activeVariables(): Record<string, string> {
+  return { ...environmentVariables(environments[environmentIdx]), ...secretVariables(), ...cliVariables };
+}
+
+function environmentNames(collection = COLLECTION): string[] {
+  try {
+    return readdirSync(collection)
+      .filter((entry) => entry.startsWith(".env.") && !entry.endsWith(".example") && statSync(join(collection, entry)).isFile())
+      .map((entry) => entry.slice(".env.".length))
+      .sort();
+  } catch {
+    return [];
+  }
 }
 
 function addResponseOutput(source: string, outputFile: string): string {
@@ -116,7 +273,7 @@ function addResponseOutput(source: string, outputFile: string): string {
 }
 
 function emptyRunResult(error: string): RunResult {
-  return { success: false, status: 0, ms: 0, asserts: { passed: 0, total: 0 }, captures: [], headers: [], body: "", error };
+  return { success: false, status: 0, ms: 0, asserts: { passed: 0, total: 0 }, captures: [], captured: {}, headers: [], body: "", error };
 }
 
 function normalizeHurlError(error: string): string {
@@ -130,6 +287,33 @@ function normalizeHurlError(error: string): string {
   return title ?? text.split(/\r?\n/)[0] ?? "Unknown Hurl error";
 }
 
+function normalizeAssertMessage(message: string): string {
+  const lines = message.split("\n");
+  const title = (lines[0] ?? "").replace(/^error:\s*/, "").trim() || "Assert failed";
+  const caret = lines.find((line) => /\^{2,}/.test(line));
+  const detail = caret?.replace(/^.*?\^{2,}\s*/, "").trim();
+  return detail ? `${title}: ${detail}` : title;
+}
+
+function prettyBody(body: string): string {
+  const trimmed = body.trim();
+  if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return body;
+  try {
+    return JSON.stringify(JSON.parse(trimmed), null, 2);
+  } catch {
+    return body;
+  }
+}
+
+const BODY_DISPLAY_LINES = 2000;
+
+function formatBody(body: string): string {
+  const pretty = prettyBody(body);
+  const lines = pretty.split("\n");
+  if (lines.length <= BODY_DISPLAY_LINES) return pretty;
+  return `${lines.slice(0, BODY_DISPLAY_LINES).join("\n")}\n… truncated, showing ${BODY_DISPLAY_LINES} of ${lines.length} lines · press s to save the full body to a file`;
+}
+
 async function runHurl(requestsToRun: Req[]): Promise<RunResult[]> {
   const tempDir = mkdtempSync(join(tmpdir(), "termurl-run-"));
   const hurlFile = join(tempDir, "run.hurl");
@@ -140,7 +324,7 @@ async function runHurl(requestsToRun: Req[]): Promise<RunResult[]> {
   writeFileSync(hurlFile, source);
 
   const args = ["hurl", "--json", "--no-color", "--error-format", "long", "--file-root", tempDir];
-  for (const [name, value] of Object.entries(profileVariables(profiles[profileIdx]))) {
+  for (const [name, value] of Object.entries(activeVariables())) {
     args.push("--variable", `${name}=${value}`);
   }
   args.push(hurlFile);
@@ -161,18 +345,24 @@ async function runHurl(requestsToRun: Req[]): Promise<RunResult[]> {
       const call = entry?.calls?.[entry.calls.length - 1];
       const asserts = entry?.asserts ?? [];
       const duration = entry?.time ?? (call?.timings?.total ? call.timings.total / 1000 : 0);
-      const failedAsserts = asserts.filter((assert) => !assert.success).map((assert) => assert.message).filter(Boolean);
+      const failedAsserts = asserts.filter((assert) => !assert.success).map((assert) => assert.message).filter(Boolean).map(normalizeAssertMessage);
       const bodyPath = join(tempDir, outputFiles[index]);
       let body = "";
       try { body = readFileSync(bodyPath, "utf8"); } catch {}
       const status = call?.response?.status ?? 0;
       const error = failedAsserts.join("\n\n") || (!call ? normalizeHurlError(processError) : undefined);
+      const captured = Object.fromEntries(
+        (entry?.captures ?? [])
+          .filter((capture) => capture.name)
+          .map((capture) => [capture.name as string, capture.value ?? ""]),
+      );
       return {
         success: Boolean(entry && status > 0 && failedAsserts.length === 0),
         status,
         ms: Math.round(duration),
         asserts: { passed: asserts.filter((assert) => assert.success).length, total: asserts.length },
         captures: captureNames(req),
+        captured,
         headers: call?.response?.headers?.map((header) => `${header.name}: ${header.value}`) ?? [],
         body,
         ...(error ? { error } : {}),
@@ -183,6 +373,256 @@ async function runHurl(requestsToRun: Req[]): Promise<RunResult[]> {
   } finally {
     rmSync(tempDir, { recursive: true, force: true });
   }
+}
+
+function positionalArgs(values: string[]): string[] {
+  const positional: string[] = [];
+  for (let index = 0; index < values.length; index += 1) {
+    const value = values[index];
+    if (value === "--env" || value === "--var") {
+      index += 1;
+      continue;
+    }
+    if (value.startsWith("--env=") || value.startsWith("--var=") || value === "--json" || value === "--reveal" || value === "--quiet" || value === "-q") continue;
+    if (!value.startsWith("-")) positional.push(value);
+  }
+  return positional;
+}
+
+function optionValue(values: string[], name: string): string | undefined {
+  const index = values.indexOf(name);
+  if (index >= 0) return values[index + 1];
+  const prefix = `${name}=`;
+  const inline = values.find((value) => value.startsWith(prefix));
+  return inline?.slice(prefix.length);
+}
+
+function parseCliVariables(values: string[]): { variables?: Record<string, string>; error?: string } {
+  const variables: Record<string, string> = {};
+  for (let index = 0; index < values.length; index += 1) {
+    const argument = values[index];
+    if (argument !== "--var" && !argument.startsWith("--var=")) continue;
+    const pair = argument === "--var" ? values[++index] : argument.slice("--var=".length);
+    if (pair === undefined) return { error: "--var requires KEY=value" };
+    const separator = pair.indexOf("=");
+    if (separator <= 0) return { error: `invalid variable ${pair}; expected KEY=value` };
+    variables[pair.slice(0, separator)] = pair.slice(separator + 1);
+  }
+  return { variables };
+}
+
+function requestForInput(input: string): Req | undefined {
+  const withoutExtension = input.replace(/\.hurl$/, "");
+  const absolute = resolve(input);
+  const relativeName = COLLECTION ? relative(COLLECTION, absolute).replace(/\.hurl$/, "") : "";
+  return requests.find((request) => request.name === input || request.name === withoutExtension || request.name === relativeName || request.file === absolute);
+}
+
+function unknownRequest(input: string): number {
+  console.error(`termurl: unknown request "${input}"`);
+  if (requests.length) console.error(`available requests:\n${requests.map((request) => `  ${request.name}`).join("\n")}`);
+  return 1;
+}
+
+function listCommand(json: boolean): number {
+  const result = requests.map((request) => ({
+    name: request.name,
+    file: request.file,
+    method: request.method,
+    path: request.path,
+    description: request.desc,
+    variables: request.vars,
+  }));
+  if (json) {
+    console.log(JSON.stringify(result, null, 2));
+    return 0;
+  }
+  const width = requests.reduce((max, request) => Math.max(max, request.name.length), 0);
+  for (const request of requests) {
+    console.log(`${request.name.padEnd(width)}  ${request.method.padEnd(7)}  ${request.path}${request.desc ? `  - ${request.desc}` : ""}`);
+  }
+  return 0;
+}
+
+function showCommand(input: string | undefined): number {
+  if (!input) {
+    console.error("termurl: usage: termurl show <request>");
+    return 1;
+  }
+  const request = requestForInput(input);
+  if (!request) return unknownRequest(input);
+  process.stdout.write(readFileSync(request.file, "utf8"));
+  return 0;
+}
+
+function envListCommand(json: boolean): number {
+  const names = environmentNames();
+  if (json) {
+    console.log(JSON.stringify(names, null, 2));
+    return 0;
+  }
+  for (const name of names) console.log(name);
+  return 0;
+}
+
+function envShowCommand(name: string | undefined, reveal: boolean, json: boolean): number {
+  if (!name) {
+    console.error("termurl: usage: termurl env show <name> [--reveal] [--json]");
+    return 1;
+  }
+  const names = environmentNames();
+  if (!names.includes(name)) {
+    console.error(`termurl: unknown environment "${name}"`);
+    console.error(`available environments: ${names.join(", ") || "none"}`);
+    return 1;
+  }
+  const values = new Map<string, { value: string; source: string; secret: boolean }>();
+  for (const [key, value] of Object.entries(environmentVariables(name))) values.set(key, { value, source: `.env.${name}`, secret: false });
+  for (const [key, value] of Object.entries(secretVariables())) values.set(key, { value, source: ".env", secret: true });
+  const variables = [...values.entries()].map(([key, item]) => ({
+    key,
+    value: item.secret && !reveal ? "***" : item.value,
+    source: item.source,
+    secret: item.secret,
+    masked: item.secret && !reveal,
+  }));
+  if (json) {
+    console.log(JSON.stringify({ environment: name, variables }, null, 2));
+    return 0;
+  }
+  for (const variable of variables) {
+    const note = variable.secret && variable.masked ? ", masked" : "";
+    console.log(`${variable.key} = ${variable.value}  (${variable.source}${note})`);
+  }
+  return 0;
+}
+
+function doctorCommand(json: boolean): number {
+  let hurlVersion: string | undefined;
+  try {
+    const result = Bun.spawnSync({ cmd: ["hurl", "--version"], stdout: "pipe", stderr: "pipe" });
+    if (result.exitCode === 0) hurlVersion = new TextDecoder().decode(result.stdout).trim();
+  } catch {}
+
+  const configExists = existsSync(CONFIG_FILE);
+  const configuredCollection = CONFIG.collection ? resolve(expandHome(CONFIG.collection)) : undefined;
+  const collectionExists = Boolean(configuredCollection && existsSync(configuredCollection) && statSync(configuredCollection).isDirectory());
+  const collectionRequests = collectionExists ? loadRequests(configuredCollection as string).length : 0;
+  const names = collectionExists ? environmentNames(configuredCollection as string) : [];
+  const checks = {
+    hurl: { ok: Boolean(hurlVersion), detail: hurlVersion ?? "not found on PATH; install hurl v8 or newer" },
+    config: { ok: configExists, detail: configExists ? CONFIG_FILE : `missing; run termurl init to create ${CONFIG_FILE}` },
+    collection: {
+      ok: collectionExists,
+      detail: collectionExists ? `${configuredCollection} (${collectionRequests} requests)` : configuredCollection ? `not found: ${configuredCollection}` : "not configured",
+    },
+    environments: { ok: collectionExists, names },
+  };
+  const ok = checks.hurl.ok && checks.config.ok && checks.collection.ok;
+  if (json) {
+    console.log(JSON.stringify({ ok, ...checks }, null, 2));
+  } else {
+    console.log(`${checks.hurl.ok ? "ok" : "fail"} hurl: ${checks.hurl.detail}`);
+    console.log(`${checks.config.ok ? "ok" : "fail"} config: ${checks.config.detail}`);
+    console.log(`${checks.collection.ok ? "ok" : "fail"} collection: ${checks.collection.detail}`);
+    console.log(`info environments: ${names.join(", ") || "none"}`);
+  }
+  return ok ? 0 : 1;
+}
+
+function headlessResult(result: RunResult, request: Req) {
+  return {
+    request: request.name,
+    file: request.file,
+    success: result.success,
+    status: result.status,
+    durationMs: result.ms,
+    headers: result.headers,
+    body: result.body,
+    asserts: result.asserts,
+    captures: result.captured,
+    ...(result.error ? { error: result.error } : {}),
+  };
+}
+
+function printRunReport(request: Req, result: RunResult): void {
+  const status = result.status || "error";
+  const asserts = `${result.asserts.passed}/${result.asserts.total}`;
+  const captures = Object.keys(result.captured);
+  console.error(`${result.success ? "ok" : "fail"} ${request.name} ${status} ${result.ms}ms asserts ${asserts}${captures.length ? ` captures ${captures.join(",")}` : ""}`);
+  if (result.error) console.error(result.error);
+}
+
+async function runCommand(values: string[]): Promise<number> {
+  const parsed = parseCliVariables(values);
+  if (parsed.error) {
+    console.error(`termurl: ${parsed.error}`);
+    return 1;
+  }
+  const environment = optionValue(values, "--env");
+  if (environment !== undefined) {
+    const index = environments.indexOf(environment);
+    if (index < 0) {
+      console.error(`termurl: unknown environment "${environment}"`);
+      console.error(`available environments: ${environments.join(", ") || "none"}`);
+      return 1;
+    }
+    environmentIdx = index;
+  }
+  cliVariables = parsed.variables ?? {};
+  const inputs = positionalArgs(values);
+  if (inputs.length === 0) {
+    console.error("termurl: usage: termurl run <request...> [--env name] [--var KEY=value] [--json] [-q]");
+    return 1;
+  }
+  const targets: Req[] = [];
+  for (const input of inputs) {
+    const request = requestForInput(input);
+    if (!request) return unknownRequest(input);
+    targets.push(request);
+  }
+
+  const results = await runHurl(targets);
+  const json = values.includes("--json");
+  const quiet = values.includes("-q") || values.includes("--quiet");
+  if (!quiet) results.forEach((result, index) => printRunReport(targets[index], result));
+  if (json) {
+    const output = results.map((result, index) => headlessResult(result, targets[index]));
+    console.log(JSON.stringify(output.length === 1 ? output[0] : output, null, 2));
+  } else if (results.length === 1) {
+    if (results[0].body) process.stdout.write(results[0].body);
+  } else {
+    results.forEach((result, index) => {
+      if (index > 0) process.stdout.write("\n");
+      process.stdout.write(`==> ${targets[index].name}\n`);
+      if (result.body) process.stdout.write(`${result.body}${result.body.endsWith("\n") ? "" : "\n"}`);
+    });
+  }
+  if (results.some((result) => !result.success && result.status === 0)) return 2;
+  return results.some((result) => !result.success) ? 3 : 0;
+}
+
+async function runHeadlessCommand(): Promise<number> {
+  const command = args[0];
+  if (command === "list") return listCommand(args.includes("--json"));
+  if (command === "show") return showCommand(positionalArgs(args.slice(1))[0]);
+  if (command === "env") {
+    const subcommand = args[1];
+    const values = args.slice(2);
+    if (subcommand === "list") return envListCommand(values.includes("--json"));
+    if (subcommand === "show") return envShowCommand(positionalArgs(values)[0], values.includes("--reveal"), values.includes("--json"));
+    console.error("termurl: usage: termurl env list [--json] | termurl env show <name> [--reveal] [--json]");
+    return 1;
+  }
+  if (command === "run") return runCommand(args.slice(1));
+  return 1;
+}
+
+if (isDoctor) process.exit(doctorCommand(args.includes("--json")));
+if (HEADLESS_COMMANDS.has(args[0] ?? "")) process.exit(await runHeadlessCommand());
+if (!process.stdout.isTTY) {
+  console.error("termurl: interactive mode requires a terminal; use `termurl --help` for headless commands");
+  process.exit(1);
 }
 
 function copyToClipboard(renderer: any, text: string): string {
@@ -198,11 +638,9 @@ function copyToClipboard(renderer: any, text: string): string {
 const renderer = await createCliRenderer({ useMouse: true, useAlternateScreen: true } as any);
 renderer.setBackgroundColor(C.bg);
 
-const requests = loadRequests();
 const flowQueue = new Map<string, number>();
 const lastResult = new Map<string, "ok" | "fail">();
-const profiles = profileNames();
-let profileIdx = 0;
+const lastBodies = new Map<string, string>();
 type Pane = "list" | "editor" | "response";
 let pane: Pane = "list";
 let insert = false;
@@ -214,16 +652,19 @@ let visualKind: "char" | "line" | null = null;
 let visualTarget: TextareaRenderable | null = null;
 let register = "";
 let statusMsg = "";
-let profileInsert = false;
-type ProfilePane = "list" | "editor";
-let profilePane: ProfilePane = "list";
-type AppWindow = "workspace" | "history" | "profiles";
+let envInsert = false;
+type EnvPane = "list" | "editor";
+let envPane: EnvPane = "list";
+type HistoryPane = "list" | "detail";
+let historyPane: HistoryPane = "list";
+type AppWindow = "workspace" | "history" | "environments";
 let appWindow: AppWindow = "workspace";
 
 type HistoryRecord = {
   ts: string;
   request: string;
-  profile: string;
+  environment?: string;
+  profile?: string;
   status: number;
   success?: boolean;
   duration_ms: number;
@@ -239,13 +680,13 @@ type HistoryGroup = {
   key: string;
   flow: boolean;
   ts: string;
-  profile: string;
+  environment: string;
   steps: HistoryRecord[];
 };
 
 let historyGroups: HistoryGroup[] = [];
 let selectedHistory = 0;
-let selectedProfile = 0;
+let selectedEnvironment = 0;
 
 type TreeRow =
   | { type: "folder"; path: string; name: string; depth: number }
@@ -259,6 +700,7 @@ type TreeNode = {
 const collapsed = new Set<string>();
 let treeRows: TreeRow[] = [];
 let selectedRow = 0;
+let lastRowClick = { index: -1, time: 0 };
 let listPending: string | null = null;
 
 function requestLabel(r: Req): string {
@@ -275,6 +717,7 @@ const tabBar = new TextRenderable(renderer, {
   content: "",
   height: 1,
   backgroundColor: "#24283b",
+  selectable: false,
 } as any);
 root.add(tabBar);
 
@@ -308,6 +751,7 @@ rightCol.add(editorBox);
 const editor = new TextareaRenderable(renderer, {
   initialValue: requests[0] ? readFileSync(requests[0].file, "utf8") : "",
   backgroundColor: C.bg, textColor: C.fg,
+  selectable: true,
 });
 editorBox.add(editor);
 
@@ -320,13 +764,15 @@ const respView = new TextareaRenderable(renderer, {
   backgroundColor: C.bg,
   textColor: C.fg,
   selectable: true,
+  width: "100%",
+  height: "100%",
 });
 respView.setText("run a request with enter");
 respView.onKeyDown = (key) => key.preventDefault();
 respView.onPaste = (event) => event.preventDefault();
 responseBox.add(respView);
 
-const statusBar = new TextRenderable(renderer, { content: "", height: 1, backgroundColor: "#24283b" } as any);
+const statusBar = new TextRenderable(renderer, { content: "", height: 1, backgroundColor: "#24283b", selectable: false } as any);
 
 const historyWindow = new BoxRenderable(renderer, {
   flexDirection: "row",
@@ -366,63 +812,73 @@ historyWindow.add(historyDetailBox);
 const historyDetail = new TextareaRenderable(renderer, {
   backgroundColor: C.bg,
   textColor: C.fg,
+  selectable: true,
 });
 historyDetailBox.add(historyDetail);
 historyWindow.visible = false;
 
-const profileWindow = new BoxRenderable(renderer, {
+const envWindow = new BoxRenderable(renderer, {
   flexDirection: "row",
   flexGrow: 1,
   backgroundColor: C.bg,
 });
-root.add(profileWindow);
+root.add(envWindow);
 
-const profileListBox = new BoxRenderable(renderer, {
+const envListBox = new BoxRenderable(renderer, {
   width: 32,
   border: true,
   borderStyle: "single",
-  title: " PROFILES ",
+  title: " ENVIRONMENTS ",
   borderColor: C.dim,
   backgroundColor: C.bg,
   flexDirection: "column",
 });
-profileWindow.add(profileListBox);
+envWindow.add(envListBox);
 
-const profileList = new BoxRenderable(renderer, {
+const envList = new BoxRenderable(renderer, {
   flexGrow: 1,
   flexDirection: "column",
   backgroundColor: C.bg,
 });
-profileListBox.add(profileList);
+envListBox.add(envList);
 
-const profileDetailBox = new BoxRenderable(renderer, {
+const envDetailBox = new BoxRenderable(renderer, {
   flexGrow: 1,
   border: true,
   borderStyle: "single",
-  title: " PROFILE (termurl.toml) ",
+  title: " ENVIRONMENT ",
   borderColor: C.dim,
   backgroundColor: C.bg,
 });
-profileWindow.add(profileDetailBox);
+envWindow.add(envDetailBox);
 
-const profileDetail = new TextareaRenderable(renderer, {
+const envDetail = new TextareaRenderable(renderer, {
   backgroundColor: C.bg,
   textColor: C.fg,
+  selectable: true,
 });
-profileDetailBox.add(profileDetail);
-profileWindow.visible = false;
+envDetailBox.add(envDetail);
+envWindow.visible = false;
 root.add(statusBar);
+
+listBox.onMouseDown = () => { if (appWindow === "workspace" && pane !== "list") setPane("list"); };
+editorBox.onMouseDown = () => { if (appWindow === "workspace" && pane !== "editor") setPane("editor"); };
+responseBox.onMouseDown = () => { if (appWindow === "workspace" && pane !== "response") setPane("response"); };
+historyListBox.onMouseDown = () => { if (appWindow === "history" && historyPane !== "list") setHistoryPane("list"); };
+historyDetailBox.onMouseDown = () => { if (appWindow === "history" && historyPane !== "detail") setHistoryPane("detail"); };
+envListBox.onMouseDown = () => { if (appWindow === "environments" && envPane !== "list") setEnvPane("list"); };
+envDetailBox.onMouseDown = () => { if (appWindow === "environments" && envPane !== "editor") setEnvPane("editor"); };
 
 function currentReq(): Req | null {
   const row = treeRows[selectedRow];
   return row?.type === "request" ? row.req : null;
 }
 
-type VariableSource = "profile" | "environment" | "capture" | "unresolved";
+type VariableSource = "file" | "secret" | "capture" | "unresolved";
 
 const variableSyntax = SyntaxStyle.fromStyles({
-  profile: { fg: C.green },
-  environment: { fg: C.yellow },
+  file: { fg: C.green },
+  secret: { fg: C.yellow },
   capture: { fg: C.blue },
   unresolved: { fg: C.red },
 });
@@ -492,74 +948,94 @@ function availableCaptures(req: Req | null): Set<string> {
   return available;
 }
 
-function variableSource(name: string, req: Req | null = currentReq(), profile = profiles[profileIdx]): VariableSource {
+function variableSource(name: string, req: Req | null = currentReq(), environment = environments[environmentIdx]): VariableSource {
   if (availableCaptures(req).has(name)) return "capture";
-  if (profileVariables(profile)[name] !== undefined) return "profile";
-  if (Bun.env[`HURL_VARIABLE_${name}`] !== undefined) return "environment";
+  if (secretVariables()[name] !== undefined) return "secret";
+  if (environmentVariables(environment)[name] !== undefined) return "file";
   return "unresolved";
 }
 
 function renderTabs() {
   const tab = (key: string, label: string, active: boolean) => active ? `[${key} ${label}]` : ` ${key} ${label} `;
-  tabBar.content = ` ${tab("1", "Workspace", appWindow === "workspace")} ${tab("2", "History", appWindow === "history")} ${tab("3", "Profiles", appWindow === "profiles")}    profile: ${profiles[profileIdx]}`;
+  tabBar.content = ` ${tab("1", "Workspace", appWindow === "workspace")} ${tab("2", "History", appWindow === "history")} ${tab("3", "Environments", appWindow === "environments")}    env: ${environments[environmentIdx]}`;
 }
 
-function renderProfiles() {
-  for (const child of profileList.getChildren()) {
-    profileList.remove(child);
+function envTitle(state: "list" | "editor" | "insert"): string {
+  if (state === "insert") return " ENVIRONMENT (INSERT · ctrl-s save · esc normal) ";
+  if (state === "editor") return " ENVIRONMENT (i edit · ctrl-s save · esc list) ";
+  return ` ENVIRONMENT (.env.${environments[selectedEnvironment]}) `;
+}
+
+function renderEnvironments() {
+  for (const child of envList.getChildren()) {
+    envList.remove(child);
     child.destroy();
   }
-  profiles.forEach((profile, index) => {
-    const active = index === profileIdx;
-    const selected = index === selectedProfile;
-    profileList.add(new TextRenderable(renderer, {
-      content: `${selected ? ">" : " "} ${profile}${active ? "  (active)" : ""}`,
+  environments.forEach((environment, index) => {
+    const active = index === environmentIdx;
+    const selected = index === selectedEnvironment;
+    const rowRenderable = new TextRenderable(renderer, {
+      content: `${selected ? ">" : " "} ${environment}${active ? "  (active)" : ""}`,
       width: "100%",
       height: 1,
       fg: active ? C.green : C.fg,
       bg: selected ? "#292e42" : C.bg,
       truncate: true,
-    }));
+      selectable: false,
+    });
+    rowRenderable.onMouseDown = () => {
+      if (appWindow === "environments" && envPane !== "list") setEnvPane("list");
+      selectedEnvironment = index;
+      renderEnvironments();
+      loadEnvironmentFile();
+    };
+    envList.add(rowRenderable);
   });
 }
 
-function loadProfileFile() {
-  profileDetail.setText(readFileSync(PROFILE_FILE, "utf8"));
+function loadEnvironmentFile() {
+  try {
+    envDetail.setText(readFileSync(environmentFile(environments[selectedEnvironment]), "utf8"));
+  } catch {
+    envDetail.setText("");
+  }
+  if (envPane === "list" && !envInsert) envDetailBox.title = envTitle("list");
 }
 
-function saveProfileFile() {
-  writeFileSync(PROFILE_FILE, profileDetail.plainText);
+function saveEnvironmentFile() {
+  const name = environments[selectedEnvironment];
+  writeFileSync(environmentFile(name), envDetail.plainText);
   refreshEditorHighlights();
-  statusMsg = "saved termurl.toml";
+  statusMsg = `saved .env.${name}`;
   setStatus();
   setTimeout(() => { statusMsg = ""; setStatus(); }, 2000);
 }
 
-function enterProfileInsert() {
-  profileInsert = true;
-  profileDetailBox.title = " PROFILE (INSERT · ctrl-s save · esc normal) ";
-  profileDetail.focus();
+function enterEnvInsert() {
+  envInsert = true;
+  envDetailBox.title = envTitle("insert");
+  envDetail.focus();
   setStatus();
 }
 
-function leaveProfileInsert() {
-  profileInsert = false;
-  profilePane = "editor";
-  profileDetailBox.title = " PROFILE (i edit · ctrl-s save · esc list) ";
-  profileDetail.focus();
+function leaveEnvInsert() {
+  envInsert = false;
+  envPane = "editor";
+  envDetailBox.title = envTitle("editor");
+  envDetail.focus();
   setStatus();
 }
 
-function setProfilePane(next: ProfilePane) {
+function setEnvPane(next: EnvPane) {
   clearVisual();
   pending = null;
-  profileInsert = false;
-  profilePane = next;
-  profileListBox.borderColor = next === "list" ? C.yellow : C.dim;
-  profileDetailBox.borderColor = next === "editor" ? C.yellow : C.dim;
-  profileDetailBox.title = next === "editor" ? " PROFILE (i edit · ctrl-s save · esc list) " : " PROFILE (termurl.toml) ";
-  if (next === "editor") profileDetail.focus();
-  else profileDetail.blur();
+  envInsert = false;
+  envPane = next;
+  envListBox.borderColor = next === "list" ? C.yellow : C.dim;
+  envDetailBox.borderColor = next === "editor" ? C.yellow : C.dim;
+  envDetailBox.title = envTitle(next);
+  if (next === "editor") envDetail.focus();
+  else envDetail.blur();
   setStatus();
 }
 
@@ -606,7 +1082,7 @@ function historyDetailText(group: HistoryGroup | undefined): string {
   if (!group) return "No runs recorded yet.";
   const duration = group.steps.reduce((sum, step) => sum + step.duration_ms, 0);
   const lines = [
-    `${group.flow ? "FLOW" : "REQUEST"} · ${group.profile}`,
+    `${group.flow ? "FLOW" : "REQUEST"} · ${group.environment}`,
     `started: ${group.ts}`,
     `duration: ${duration}ms · status: ${historyStatus(group)}`,
     "",
@@ -627,14 +1103,21 @@ function renderHistory() {
     child.destroy();
   }
   historyGroups.forEach((group, index) => {
-    historyList.add(new TextRenderable(renderer, {
+    const rowRenderable = new TextRenderable(renderer, {
       content: historyTitle(group),
       width: "100%",
       height: 1,
       fg: index === selectedHistory ? C.fg : C.dim,
       bg: index === selectedHistory ? "#292e42" : C.bg,
       truncate: true,
-    }));
+      selectable: false,
+    });
+    rowRenderable.onMouseDown = () => {
+      if (appWindow === "history" && historyPane !== "list") setHistoryPane("list");
+      selectedHistory = index;
+      renderHistory();
+    };
+    historyList.add(rowRenderable);
   });
   const group = historyGroups[selectedHistory];
   const text = historyDetailText(group);
@@ -660,7 +1143,7 @@ function loadHistory() {
         key,
         flow: Boolean(record.flow_id || record.flow_size && record.flow_size > 1),
         ts: record.ts,
-        profile: record.profile,
+        environment: record.environment ?? record.profile ?? "-",
         steps: [],
       };
       groups.set(key, group);
@@ -684,7 +1167,7 @@ function recordHistory(req: Req, result: RunResult, flowId?: string, step?: numb
   const record: HistoryRecord = {
     ts: new Date().toISOString(),
     request: req.name,
-    profile: profiles[profileIdx],
+    environment: environments[environmentIdx],
     status: result.status,
     success: result.success,
     duration_ms: result.ms,
@@ -751,14 +1234,35 @@ function renderTree() {
     const content = row.type === "folder"
       ? `${"  ".repeat(row.depth)}${collapsed.has(row.path) ? "▸" : "▾"} ${row.name}/`
       : `${"  ".repeat(row.depth + 1)}${requestLabel(row.req)}`;
-    treeList.add(new TextRenderable(renderer, {
+    const rowRenderable = new TextRenderable(renderer, {
       content,
       width: "100%",
       height: 1,
       fg: row.type === "folder" ? C.cyan : C.fg,
       bg: selected ? "#292e42" : C.bg,
       truncate: true,
-    }));
+      selectable: false,
+    });
+    rowRenderable.onMouseDown = () => {
+      if (appWindow === "workspace" && pane !== "list") setPane("list");
+      const now = Date.now();
+      const doubleClick = lastRowClick.index === index && now - lastRowClick.time < 400;
+      lastRowClick = { index, time: now };
+      selectedRow = index;
+      if (row.type === "folder") {
+        collapsed.has(row.path) ? collapsed.delete(row.path) : collapsed.add(row.path);
+        refreshList();
+        return;
+      }
+      if (doubleClick) {
+        toggleFlowRequest(row.req);
+        refreshList(row.req.name);
+        setStatus();
+        return;
+      }
+      moveSelection(0);
+    };
+    treeList.add(rowRenderable);
   });
 }
 
@@ -821,14 +1325,27 @@ function scrollText(target: TextareaRenderable, delta: number) {
   );
 }
 
+function ensureCursorVisible(target: TextareaRenderable) {
+  const view = target.editorView;
+  const viewport = view.getViewport();
+  const logicalRow = target.editBuffer.getCursorPosition().row;
+  const sources = view.getLogicalLineInfo().lineSources;
+  const visualIndex = sources.indexOf(logicalRow);
+  const visualRow = visualIndex < 0 ? logicalRow : visualIndex;
+  let offsetY = viewport.offsetY;
+  if (visualRow < offsetY) offsetY = visualRow;
+  else if (visualRow >= offsetY + viewport.height) offsetY = visualRow - viewport.height + 1;
+  if (offsetY !== viewport.offsetY) view.setViewport(viewport.offsetX, offsetY, viewport.width, viewport.height, false);
+}
+
 function setStatus() {
-  const mode = appWindow === "history" ? "HISTORY" : appWindow === "profiles" ? (profileInsert ? "PROFILE-INSERT" : profilePane === "editor" ? "PROFILE-NORMAL" : "PROFILES") : pane === "editor"
+  const mode = appWindow === "history" ? (historyPane === "detail" ? (visual ? "VISUAL" : "RUN-DETAILS") : "HISTORY") : appWindow === "environments" ? (envInsert ? "ENV-INSERT" : envPane === "editor" ? "ENV-NORMAL" : "ENVIRONMENTS") : pane === "editor"
     ? (insert ? "INSERT" : visual ? "REQ-VISUAL" : "REQ-NORMAL")
     : pane === "response" && visual ? "VISUAL" : pane.toUpperCase();
   const last = [...lastResult.entries()].slice(-1)[0];
   renderTabs();
   statusBar.content =
-    ` ${appWindow === "workspace" ? "1 WORKSPACE" : appWindow === "history" ? "2 HISTORY" : "3 PROFILES"} · ${mode} · profile: ${profiles[profileIdx]} · queued: ${flowQueue.size}` +
+    ` ${appWindow === "workspace" ? "1 WORKSPACE" : appWindow === "history" ? "2 HISTORY" : "3 ENVIRONMENTS"} · ${mode} · env: ${environments[environmentIdx]} · queued: ${flowQueue.size}` +
     (last ? ` · last: ${last[0]} ${last[1] === "ok" ? "✓" : "✗"}` : "") +
     (statusMsg ? ` · ${statusMsg}` : "") +
     (pending ? ` · ${pending}` : "") +
@@ -843,13 +1360,25 @@ function setPane(p: Pane) {
   listBox.borderColor = p === "list" ? C.yellow : C.dim;
   editorBox.borderColor = p === "editor" ? C.yellow : C.dim;
   responseBox.borderColor = p === "response" ? C.yellow : C.dim;
-  listBox.title = p === "list" ? " REQUESTS (focused) " : " REQUESTS ";
+  listBox.title = " REQUESTS ";
   editorBox.title = p === "editor" ? " REQUEST (i edit · ctrl-s save · esc list) " : " REQUEST ";
-  responseBox.title = p === "response" ? " RESPONSE (hjkl · v/V select · y copy) " : " RESPONSE ";
+  responseBox.title = p === "response" ? " RESPONSE (hjkl · v/V select · y copy · s save body) " : " RESPONSE ";
   if (p === "editor") editor.focus();
   else editor.blur();
   if (p === "response") respView.focus();
   else respView.blur();
+  setStatus();
+}
+
+function setHistoryPane(next: HistoryPane) {
+  clearVisual();
+  pending = null;
+  historyPane = next;
+  historyListBox.borderColor = next === "list" ? C.yellow : C.dim;
+  historyDetailBox.borderColor = next === "detail" ? C.yellow : C.dim;
+  historyDetailBox.title = next === "detail" ? " RUN DETAILS (hjkl · v/V select · y copy · esc list) " : " RUN DETAILS ";
+  if (next === "detail") historyDetail.focus();
+  else historyDetail.blur();
   setStatus();
 }
 
@@ -858,33 +1387,35 @@ function setWindow(next: AppWindow) {
   filterInput.blur();
   editor.blur();
   respView.blur();
-  profileInsert = false;
-  profileDetail.blur();
+  historyDetail.blur();
+  envInsert = false;
+  envDetail.blur();
   appWindow = next;
   main.visible = next === "workspace";
   historyWindow.visible = next === "history";
-  profileWindow.visible = next === "profiles";
+  envWindow.visible = next === "environments";
   if (next === "history") {
     loadHistory();
+    historyPane = "list";
     historyListBox.borderColor = C.yellow;
     historyDetailBox.borderColor = C.dim;
-    profileListBox.borderColor = C.dim;
-    profileDetailBox.borderColor = C.dim;
-  } else if (next === "profiles") {
-    selectedProfile = profileIdx;
-    renderProfiles();
-    loadProfileFile();
-    profilePane = "list";
-    profileDetailBox.title = " PROFILE (termurl.toml) ";
+    historyDetailBox.title = " RUN DETAILS ";
+    envListBox.borderColor = C.dim;
+    envDetailBox.borderColor = C.dim;
+  } else if (next === "environments") {
+    selectedEnvironment = environmentIdx;
+    envPane = "list";
+    renderEnvironments();
+    loadEnvironmentFile();
     historyListBox.borderColor = C.dim;
     historyDetailBox.borderColor = C.dim;
-    profileListBox.borderColor = C.yellow;
-    profileDetailBox.borderColor = C.dim;
+    envListBox.borderColor = C.yellow;
+    envDetailBox.borderColor = C.dim;
   } else {
     historyListBox.borderColor = C.dim;
     historyDetailBox.borderColor = C.dim;
-    profileListBox.borderColor = C.dim;
-    profileDetailBox.borderColor = C.dim;
+    envListBox.borderColor = C.dim;
+    envDetailBox.borderColor = C.dim;
     setPane(pane);
   }
   setStatus();
@@ -898,11 +1429,11 @@ function moveHistory(delta: number) {
 
 function formatRun(req: Req, r: RunResult): string {
   const ok = r.success;
-  return `${ok ? "✓" : "✗"} ${r.status} ${ok ? "OK" : "FAILED"} · ${r.ms}ms · profile: ${profiles[profileIdx]}\n` +
+  return `${ok ? "✓" : "✗"} ${r.status} ${ok ? "OK" : "FAILED"} · ${r.ms}ms · env: ${environments[environmentIdx]}\n` +
     `asserts: ${r.asserts.passed}/${r.asserts.total} passed · captures: ${r.captures.join(", ") || "-"}\n\n` +
     (r.headers.length ? `headers:\n${r.headers.join("\n")}\n\n` : "") +
     (r.error ? `reason:\n${r.error}\n\n` : "") +
-    (r.body || "(empty response body)");
+    (r.body ? formatBody(r.body) : "(empty response body)");
 }
 
 async function runRequest(req: Req) {
@@ -910,6 +1441,8 @@ async function runRequest(req: Req) {
   setStatus();
   const [r] = await runHurl([req]);
   lastResult.set(req.name, r.success ? "ok" : "fail");
+  lastBodies.clear();
+  if (r.body) lastBodies.set(req.name, r.body);
   renderResponse(formatRun(req, r), !r.success);
   refreshEditorHighlights();
   recordHistory(req, r);
@@ -931,15 +1464,17 @@ async function runFlow() {
   statusMsg = `running flow (${targets.length} requests)`;
   setStatus();
   const results = await runHurl(targets);
+  lastBodies.clear();
   const flowId = `flow-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const parts = targets.map((req, index) => {
     const r = results[index] ?? emptyRunResult("Hurl did not return a result for this step");
     lastResult.set(req.name, r.success ? "ok" : "fail");
+    if (r.body) lastBodies.set(req.name, r.body);
     const response = formatRun(req, r);
     recordHistory(req, r, flowId, index + 1, targets.length);
     return `▸ ${index + 1}. ${req.name}\n${response}`;
   });
-  renderResponse(`flow (profile: ${profiles[profileIdx]}), ${targets.length} requests\n\n` + parts.join("\n\n"), results.some((result) => !result.success));
+  renderResponse(`flow (env: ${environments[environmentIdx]}), ${targets.length} requests\n\n` + parts.join("\n\n"), results.some((result) => !result.success));
   refreshEditorHighlights();
   refreshList(currentReq()?.name);
   statusMsg = "";
@@ -1004,6 +1539,7 @@ function moveVisual(target: TextareaRenderable, k: string, key: KeyEvent): boole
     pending = null;
     if (p === "g" && k === "g") {
       eb.setCursor(0, 0);
+      ensureCursorVisible(target);
       updateVisualSelection(target);
     }
     setStatus();
@@ -1036,15 +1572,16 @@ function moveVisual(target: TextareaRenderable, k: string, key: KeyEvent): boole
   } else {
     return false;
   }
+  ensureCursorVisible(target);
   updateVisualSelection(target);
   setStatus();
   return true;
 }
 
-function vimNormal(k: string, key: KeyEvent, target: TextareaRenderable = editor, readOnly = false, editKind: "request" | "profile" = "request") {
+function vimNormal(k: string, key: KeyEvent, target: TextareaRenderable = editor, readOnly = false, editKind: "request" | "environment" = "request") {
   const eb = target.editBuffer;
   const shift = key.shift;
-  const startInsert = () => editKind === "profile" ? enterProfileInsert() : enterInsert();
+  const startInsert = () => editKind === "environment" ? enterEnvInsert() : enterInsert();
   const yankLine = () => {
     const { row } = eb.getCursorPosition();
     const start = eb.getLineStartOffset(row);
@@ -1062,7 +1599,7 @@ function vimNormal(k: string, key: KeyEvent, target: TextareaRenderable = editor
   if (pending) {
     const p = pending;
     pending = null;
-    if (p === "g" && k === "g") eb.setCursor(0, 0);
+    if (p === "g" && k === "g") { eb.setCursor(0, 0); ensureCursorVisible(target); }
     else if (p === "y" && k === "y") yankLine();
     else if (!readOnly && p === "d" && k === "d") {
       const { row } = eb.getCursorPosition();
@@ -1108,7 +1645,8 @@ function vimNormal(k: string, key: KeyEvent, target: TextareaRenderable = editor
     if (register) { const e = eb.getEOL(); eb.setCursor(e.row, e.col); eb.newLine(); eb.insertText(register.replace(/\n$/, "")); }
   }
   else if (!readOnly && k === "u") eb.undo();
-  else if (!readOnly && k === "r" && key.ctrl) eb.redo();
+  else if (k === "r" && key.ctrl) eb.redo();
+  ensureCursorVisible(target);
   setStatus();
 }
 
@@ -1121,86 +1659,94 @@ function saveEditor() {
   setTimeout(() => { statusMsg = ""; setStatus(); }, 2000);
 }
 
-const HELP = `termurl keys
-  windows: 1 workspace · 2 history · 3 profiles (NORMAL mode)
+const TUI_HELP = `termurl keys
+  windows: 1 workspace · 2 history · 3 environments (NORMAL mode)
   list:  j/k move · ctrl-d/u page · / filter · enter run/collapse · tab queue/unqueue
          ctrl-enter flow · ctrl-f flow
-         e request pane · i edit now · ctrl-n new · ctrl-x delete · ctrl-p profile · q quit
+         e request pane · i edit now · ctrl-n new · ctrl-x delete · ctrl-p environment · q quit
   panes: ctrl-l next (list -> request -> response) · ctrl-h prev · esc back to list
   req:   NORMAL hjkl/w/b/g/G move · v/V visual · i insert · INSERT esc normal · ctrl-s save
-  resp:  NORMAL hjkl/w/b/g/G · v/V visual · yy line · Y all · c copy mouse selection
-  hist:  j/k move · enter inspect · y copy details · 1 workspace · q quit
-   prof:  j/k move · enter activate · ctrl-l/e termurl.toml · ctrl-h/esc list · i insert when focused · ctrl-s save · q quit`;
+  resp:  NORMAL hjkl/w/b/g/G · v/V visual · yy line · Y all · c copy mouse selection · s save body to file
+  hist:  j/k move · enter/ctrl-l details · ctrl-h/esc list · y copy all
+         details: NORMAL hjkl/w/b/g/G · v/V visual · y selection · yy line · Y all
+   env:  j/k move · enter activate · ctrl-l/e env file · ctrl-h/esc list · i insert when focused · ctrl-s save · q quit`;
 
 let helpOn = false;
 renderer.keyInput.on("keypress", (key: KeyEvent) => {
   const k = key.name;
   if (helpOn) { helpOn = false; respView.setText(""); setStatus(); key.preventDefault(); return; }
 
-  if (!insert && !profileInsert && !visual && !pending && !listPending && !filterInputFocused()) {
+  if (!insert && !envInsert && !visual && !pending && !listPending && !filterInputFocused()) {
     if (k === "1") { setWindow("workspace"); key.preventDefault(); return; }
     if (k === "2") { setWindow("history"); key.preventDefault(); return; }
-    if (k === "3") { setWindow("profiles"); key.preventDefault(); return; }
+    if (k === "3") { setWindow("environments"); key.preventDefault(); return; }
   }
 
-  if (appWindow === "profiles") {
-    if (profileInsert) {
-      if (k === "s" && key.ctrl) { saveProfileFile(); key.preventDefault(); return; }
-      if (k === "h" && key.ctrl) { leaveProfileInsert(); setProfilePane("list"); key.preventDefault(); return; }
+  if (appWindow === "environments") {
+    if (envInsert) {
+      if (k === "s" && key.ctrl) { saveEnvironmentFile(); key.preventDefault(); return; }
+      if (k === "h" && key.ctrl) { leaveEnvInsert(); setEnvPane("list"); key.preventDefault(); return; }
       if (k === "escape") {
-        leaveProfileInsert();
+        leaveEnvInsert();
         key.preventDefault(); return;
       }
       return;
     }
     if (k === "q") { renderer.destroy(); process.exit(0); }
-    if (profilePane === "editor") {
-      if (key.ctrl && k === "s") { saveProfileFile(); key.preventDefault(); return; }
-      if (key.ctrl && k === "h") { setProfilePane("list"); key.preventDefault(); return; }
-      if (k === "escape") { setProfilePane("list"); key.preventDefault(); return; }
-      vimNormal(k, key, profileDetail, false, "profile");
+    if (envPane === "editor") {
+      if (key.ctrl && k === "s") { saveEnvironmentFile(); key.preventDefault(); return; }
+      if (key.ctrl && k === "h") { setEnvPane("list"); key.preventDefault(); return; }
+      if (k === "escape") { setEnvPane("list"); key.preventDefault(); return; }
+      vimNormal(k, key, envDetail, false, "environment");
       key.preventDefault(); return;
     }
-    if (key.ctrl && k === "l") { setProfilePane("editor"); key.preventDefault(); return; }
+    if (key.ctrl && k === "l") { setEnvPane("editor"); key.preventDefault(); return; }
     if (k === "escape" || k === "1") { setWindow("workspace"); key.preventDefault(); return; }
-    if (k === "j") { selectedProfile = Math.min(profiles.length - 1, selectedProfile + 1); renderProfiles(); key.preventDefault(); return; }
-    if (k === "k") { selectedProfile = Math.max(0, selectedProfile - 1); renderProfiles(); key.preventDefault(); return; }
+    if (k === "j") { selectedEnvironment = Math.min(environments.length - 1, selectedEnvironment + 1); renderEnvironments(); loadEnvironmentFile(); key.preventDefault(); return; }
+    if (k === "k") { selectedEnvironment = Math.max(0, selectedEnvironment - 1); renderEnvironments(); loadEnvironmentFile(); key.preventDefault(); return; }
     if (k === "enter" || k === "return") {
-      profileIdx = selectedProfile;
+      environmentIdx = selectedEnvironment;
       refreshEditorHighlights();
-      renderProfiles();
-      statusMsg = `active profile: ${profiles[profileIdx]}`;
+      renderEnvironments();
+      statusMsg = `active environment: ${environments[environmentIdx]}`;
       setStatus();
       key.preventDefault(); return;
     }
     if (k === "e") {
-      setProfilePane("editor");
+      setEnvPane("editor");
       key.preventDefault(); return;
     }
     if (k === "i") {
-      setProfilePane("editor");
+      setEnvPane("editor");
       key.preventDefault(); return;
     }
-    if (k === "?") { profileDetail.setText(HELP); key.preventDefault(); return; }
+    if (k === "?") { envDetail.setText(TUI_HELP); key.preventDefault(); return; }
     key.preventDefault();
     return;
   }
 
   if (appWindow === "history") {
+    if (historyPane === "detail") {
+      if (key.ctrl && k === "h") { setHistoryPane("list"); key.preventDefault(); return; }
+      if (k === "escape") { setHistoryPane("list"); key.preventDefault(); return; }
+      vimNormal(k, key, historyDetail, true);
+      key.preventDefault(); return;
+    }
     if (k === "q") { renderer.destroy(); process.exit(0); }
     if (k === "escape") { setWindow("workspace"); key.preventDefault(); return; }
     if (k === "j") { moveHistory(1); key.preventDefault(); return; }
     if (k === "k") { moveHistory(-1); key.preventDefault(); return; }
     if (key.ctrl && k === "d") { moveHistory(5); key.preventDefault(); return; }
     if (key.ctrl && k === "u") { moveHistory(-5); key.preventDefault(); return; }
+    if (key.ctrl && k === "l") { setHistoryPane("detail"); key.preventDefault(); return; }
     if (k === "g") { selectedHistory = 0; renderHistory(); key.preventDefault(); return; }
     if (k === "G") { selectedHistory = Math.max(0, historyGroups.length - 1); renderHistory(); key.preventDefault(); return; }
-    if (k === "enter" || k === "return") { statusMsg = "history entry selected"; setStatus(); key.preventDefault(); return; }
+    if (k === "enter" || k === "return") { setHistoryPane("detail"); key.preventDefault(); return; }
     if (k === "y") {
       statusMsg = `copied history (${copyToClipboard(renderer, historyDetail.plainText)})`;
       setStatus(); key.preventDefault(); return;
     }
-    if (k === "?") { historyDetail.setText(HELP); key.preventDefault(); return; }
+    if (k === "?") { historyDetail.setText(TUI_HELP); key.preventDefault(); return; }
     key.preventDefault();
     return;
   }
@@ -1221,14 +1767,14 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
   }
 
   if (k === "q" && pane === "list" && !filterInputFocused()) { renderer.destroy(); process.exit(0); }
-  if (k === "?" && pane === "list") { helpOn = true; respView.setText(HELP); key.preventDefault(); return; }
+  if (k === "?" && pane === "list") { helpOn = true; respView.setText(TUI_HELP); key.preventDefault(); return; }
   if (k === "l" && key.ctrl) { setPane(pane === "list" ? "editor" : "response"); key.preventDefault(); return; }
   if (k === "h" && key.ctrl) { setPane(pane === "response" ? "editor" : "list"); key.preventDefault(); return; }
   if (visual && k === "escape") { clearVisual(); setStatus(); key.preventDefault(); return; }
   if (k === "escape") { setPane("list"); key.preventDefault(); return; }
   if (k === "p" && key.ctrl) {
-    profileIdx = (profileIdx + 1) % profiles.length;
-    selectedProfile = profileIdx;
+    environmentIdx = (environmentIdx + 1) % environments.length;
+    selectedEnvironment = environmentIdx;
     refreshEditorHighlights();
     setStatus();
     key.preventDefault(); return;
@@ -1294,6 +1840,25 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
       statusMsg = text ? `copied selection (${copyToClipboard(renderer, text)})` : "no selection, use v/V or drag with mouse first";
       setStatus(); key.preventDefault(); return;
     }
+    if (k === "s") {
+      if (lastBodies.size === 0) {
+        statusMsg = "no body to save, run a request first";
+        setStatus(); key.preventDefault(); return;
+      }
+      const dir = join(COLLECTION, ".termurl", "bodies");
+      mkdirSync(dir, { recursive: true });
+      const stamp = Date.now();
+      const saved: string[] = [];
+      for (const [name, body] of lastBodies) {
+        const trimmed = body.trim();
+        const ext = trimmed.startsWith("{") || trimmed.startsWith("[") ? "json" : "txt";
+        const file = join(dir, `${stamp}-${name.replaceAll("/", "-")}.${ext}`);
+        writeFileSync(file, body);
+        saved.push(file);
+      }
+      statusMsg = saved.length === 1 ? `body saved: ${saved[0]}` : `${saved.length} bodies saved to ${dir}`;
+      setStatus(); key.preventDefault(); return;
+    }
     vimNormal(k, key, respView, true);
     key.preventDefault();
     return;
@@ -1303,17 +1868,17 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
 function filterInputFocused() { return (filterInput as any).focused === true; }
 filterInput.on("input" as any, () => refreshList());
 editor.onContentChange = () => refreshEditorHighlights();
-profileDetail.onKeyDown = (key) => {
-  if (!profileInsert) return;
+envDetail.onKeyDown = (key) => {
+  if (!envInsert) return;
   if (key.ctrl && key.name === "s") {
-    saveProfileFile();
+    saveEnvironmentFile();
     key.preventDefault();
   } else if (key.ctrl && key.name === "h") {
-    leaveProfileInsert();
-    setProfilePane("list");
+    leaveEnvInsert();
+    setEnvPane("list");
     key.preventDefault();
-  } else if (key.name === "escape" || key.name === "esc" || key.sequence === "\u001b") {
-    leaveProfileInsert();
+  } else if (key.name === "escape" || key.name === "esc" || key.sequence === "") {
+    leaveEnvInsert();
     key.preventDefault();
   }
 };
@@ -1323,6 +1888,7 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
 
 loadHistory();
 refreshList(requests[0]?.name);
+if (requests.length === 0) statusMsg = `no .hurl files found in ${COLLECTION}`;
 setStatus();
 setWindow("workspace");
 setPane("list");

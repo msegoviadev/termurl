@@ -1,12 +1,18 @@
 {
   "name": "termurl",
+  "version": "0.1.0",
+  "description": "A terminal client for Hurl collections, with an agent-friendly headless CLI",
   "module": "index.ts",
   "type": "module",
-  "private": true,
+  "license": "MIT",
+  "repository": "github:msegoviadev/termurl",
+  "homepage": "https://github.com/msegoviadev/termurl",
+  "private": false,
   "scripts": {
     "dev": "bun run --watch index.ts",
     "tui": "bun run index.ts",
-    "typecheck": "bunx tsc --noEmit --target ESNext --module NodeNext --moduleResolution NodeNext --skipLibCheck index.ts"
+    "build": "bun build --compile index.ts --outfile termurl",
+    "typecheck": "bunx tsc --noEmit --target ESNext --module NodeNext --moduleResolution NodeNext --resolveJsonModule --skipLibCheck index.ts"
   },
   "devDependencies": {
     "@types/bun": "latest"

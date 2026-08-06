@@ -1,6 +1,6 @@
 # Dev WireMock
 
-This fixture provides the local API used by the dev profile at
+This fixture provides the local API used by the dev environment at
 `http://localhost:3000`.
 
 ## Start
