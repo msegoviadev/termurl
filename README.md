@@ -1,152 +1,213 @@
 # termurl
 
-Hurl for both humans and agents, powered by plain-text request files.
-termurl provides a Bun and OpenTUI interface for running requests, composing
-ordered flows, inspecting responses, and editing request and profile files.
+termurl is a terminal-first HTTP client for [Hurl](https://hurl.dev)
+collections. The same plain-text request files work in two ways:
+
+- A focused OpenTUI application for humans who want to browse, edit, queue,
+  run, and inspect requests.
+- A headless CLI for agents and scripts that need discovery, structured output,
+  predictable exit codes, and Unix-friendly piping.
 
 ## Requirements
 
-- Bun
-- Hurl 8 or newer on `PATH`
-- Docker, optional, for the local WireMock API
+- Bun, when running from source or building locally.
+- Hurl 8 or newer on `PATH`.
 
-## Setup
+Published binaries are available for macOS ARM64, macOS x64, Linux ARM64, and
+Linux x64. Hurl remains an external runtime dependency.
 
-termurl requires a config file and exits with an error if it is missing.
-Create it with the interactive installer:
+## Install
 
-```bash
-termurl init
-```
-
-The installer asks for a collection path (default `~/collection`,
-press enter to accept, or pass a path: `termurl init ./my-apis`), writes
-`~/.config/termurl/config.toml` (respects `XDG_CONFIG_HOME`), and scaffolds a
-starter collection. To use a different collection for a single run, pass it as
-an argument: `termurl ./my-apis`.
-
-## Quick Start
-
-```bash
-bun install
-bun run tui init ./collection
-bun run tui
-```
-
-A sample collection lives under `collection`. Environments are dotenv files in
-the collection root: `.env.dev` defines the `dev` environment, and its
-variables load when that environment is active. Secrets and shared variables
-go in a plain `.env` in the collection root (gitignored, overrides environment
-files); see `collection/.env.example`. All files use plain `KEY=value` lines.
-
-To build a standalone binary:
-
-```bash
-bun run build
-```
-
-## Installation
-
-Published releases can be installed with Homebrew:
+Install a published release with Homebrew:
 
 ```bash
 brew tap msegoviadev/tap
 brew install termurl
 ```
 
-The release workflow publishes standalone binaries for macOS ARM64/x64 and
-Linux ARM64/x64. See `RELEASING.md` for the tagged-release process.
-
-## Headless CLI
-
-Agents and scripts should use subcommands instead of driving the TUI:
+Or build from source:
 
 ```bash
-termurl doctor
+git clone https://github.com/msegoviadev/termurl.git
+cd termurl
+bun install
+bun run build
+```
+
+## TUI
+
+Initialize a collection and its config interactively:
+
+```bash
+termurl init
+```
+
+The installer defaults to `~/collection`, writes
+`~/.config/termurl/config.toml` (respecting `XDG_CONFIG_HOME`), and scaffolds a
+starter request. The config is required. To use another collection for one
+session, pass its path when launching the TUI:
+
+```bash
+termurl ./my-apis
+```
+
+The collection path is only an override for that run. The config must still
+exist.
+
+### TUI workflow
+
+1. Browse requests in the workspace window.
+2. Press `enter` to run the selected request.
+3. Press `tab` to queue or unqueue requests.
+4. Press `ctrl-enter` or `ctrl-f` to run the queued requests in order as one
+   Hurl flow.
+5. Use `ctrl-l` and `ctrl-h` to move between the request, editor, and response
+   panes.
+6. Press `2` for execution history or `3` for environments.
+
+Useful controls:
+
+- `j/k`: navigate lists and move the cursor in NORMAL mode.
+- `v/V`: enter character or line visual selection.
+- `yy`: copy the selected line; `Y`: copy the whole buffer.
+- `s`: save the complete response body to `.termurl/bodies/`.
+- `i`: enter INSERT mode in an editor; `ctrl-s`: save the file.
+- `ctrl-p`: cycle environments.
+- `?`: show context-sensitive help; `q`: quit.
+
+Mouse support includes pane focus, cursor positioning, row selection, folder
+expansion, double-click queue toggling, and drag selection in text areas.
+
+The response pane pretty-prints JSON and limits display to 2000 lines. The full
+body remains available through the `s` command. Assertion messages are reduced
+to the useful failure detail instead of showing Hurl's temporary source file.
+
+## Agent CLI
+
+Agents should use subcommands instead of driving the TUI. The minimum workflow
+is documented in [`skills/termurl/SKILL.md`](skills/termurl/SKILL.md).
+
+### Preflight
+
+Check the binary, config, collection, and environments:
+
+```bash
+termurl doctor --json
+```
+
+If the config does not exist, initialize non-interactively:
+
+```bash
+termurl init --yes ~/collection
+```
+
+### Discover
+
+List requests as structured data:
+
+```bash
 termurl list --json
-termurl run specs/get --env dev --json
 ```
 
-Available commands:
-
-- `termurl doctor [--json]` checks hurl, config, collection, and environments.
-- `termurl list [--json]` discovers collection-relative request names.
-- `termurl show <request>` prints the raw `.hurl` file.
-- `termurl env list [--json]` lists environments.
-- `termurl env show <name> [--reveal] [--json]` displays variables, masking
-  shared secrets by default.
-- `termurl run <request...> [--env name] [--var KEY=value] [--json]` runs the
-  explicitly named requests in argument order. A `.hurl` suffix is optional;
-  directories are not executed.
-
-In text mode, a single `run` writes the raw response body to stdout. For a flow,
-each body is preceded by its request name. `--json` writes one object for a
-single request or an array for a flow. Reports and errors go to stderr, so
-response bodies can be piped safely. Exit codes are 0 for success, 1 for usage
-or configuration errors, 2 for runtime errors, and 3 for assertion failures.
-See `skills/termurl/SKILL.md` for the minimum agent workflow.
-
-## Local API
-
-Start the deterministic WireMock API used by the `dev` environment:
+Inspect one request:
 
 ```bash
-cd wiremock
-docker compose up -d
+termurl show specs/get
 ```
 
-The API listens on `http://localhost:3000`. Stop it with
-`docker compose down` from the same directory.
+Request names are collection-relative paths without `.hurl`. The suffix is
+optional, so `specs/get` and `specs/get.hurl` identify the same request. An
+explicit `.hurl` file path inside the configured collection is also accepted.
+Directories are never executed implicitly.
 
-## Controls
+Inspect environments and variables:
 
-- `1`: workspace
-- `2`: history
-- `3`: environments
-- `j/k`: navigate the active list
-- `ctrl-l` and `ctrl-h`: move between panes
-- `enter`: run a request, open run details, or activate an environment
-- `tab`: queue or unqueue a request
-- `ctrl-enter` or `ctrl-f`: run the ordered queue as a flow
-- `e`: focus the request editor
-- `ctrl-s`: save the focused editable file
-- `ctrl-p`: cycle environments
-- `q`: quit
+```bash
+termurl env list --json
+termurl env show prod --json
+```
 
-The request and environment editors use Vim-style NORMAL and INSERT modes. The
-response pane and history run details are read-only and support NORMAL
-navigation, VISUAL selection, `yy` line copy, `Y` whole-buffer copy, and
-terminal clipboard copying.
+Values from the shared `.env` file are masked by default. Use `--reveal` only
+when exposing a secret is intentional.
 
-Mouse: clicking a pane focuses it (orange border), clicking inside a text area
-moves the cursor there, and click-drag selects multiple lines. In the request
-list, a single click selects a row (folders expand/collapse) and a double-click
-queues/unqueues the request for a flow, like `tab`.
+### Run
 
-JSON response bodies are pretty-printed. Bodies longer than 2000 lines are
-truncated in the pane with a note; press `s` in the response pane to write the
-full untruncated body to `<collection>/.termurl/bodies/`. Failed assert
-messages are reduced to the essential `Assert ...: actual value is <...>`
-instead of hurl's full source excerpt.
+Run one request with structured output:
 
-## Variable Resolution
+```bash
+termurl run specs/get --env prod --json
+```
 
-Request variables are colored by source:
+Run one request with its raw body on stdout:
 
-- Environment file (`.env.<name>`) values are green.
-- Secret values (`.env` in the collection root) are yellow.
-- Captures assigned by earlier requests in the ordered flow are blue.
-- Unresolved variables are red.
+```bash
+termurl run specs/get --env prod --quiet | jq .
+```
 
-Capture availability follows the order assigned with `tab`.
+Run an explicit ordered flow. Captures from earlier requests are available to
+later requests in the same invocation:
 
-## Collection Format
+```bash
+termurl run auth/login users/me --env dev --json
+```
 
-- One request per `.hurl` file
-- Directory path becomes the request name
-- First comment becomes the request description
-- `.env.<name>` files define environments and their variables
-- `.env` holds secrets shared across environments (never committed)
-- Hurl captures provide flow dependencies such as `token`
+Pass additional variables with repeatable `--var` options:
 
-Execution history is stored in `.termurl/history.jsonl` and is ignored by Git.
+```bash
+termurl run users/me --env dev --var token="$TOKEN"
+```
+
+## CLI Contract
+
+Headless commands are designed for pipelines:
+
+- stdout contains only response bodies, flow bodies, or `--json` output.
+- stderr contains progress reports, diagnostics, and assertion messages.
+- A single text-mode request writes its raw response body without a wrapper.
+- Multiple text-mode requests use `==> request/name` separators.
+- `--json` returns one object for a single request and an array for a flow.
+- Exit `0` means all requests passed.
+- Exit `1` means usage or configuration failed.
+- Exit `2` means a request could not run.
+- Exit `3` means a request ran but failed an assertion.
+
+This makes commands safe to compose with `jq`, `&&`, shell scripts, and agent
+tool calls without mixing diagnostics into response payloads.
+
+## Collections
+
+A collection is a directory of Hurl files. There is one request per `.hurl`
+file:
+
+```text
+my-apis/
+  .env.dev
+  .env.prod
+  .env                 # shared secrets, ignored by Git
+  specs/
+    get.hurl
+    list.hurl
+```
+
+The collection-relative file path becomes the request name. The first `#`
+comment becomes its description. Ordered flows are currently supplied as
+explicit request arguments; a first-class ordered collection format can be
+added later without changing individual request files.
+
+Environments use `.env.<name>` files. Shared secrets use a plain `.env`, which
+is not an environment. Variables are parsed as simple `KEY=value` lines.
+Variable precedence is captures, then shared `.env` values, then the selected
+environment file.
+
+## Development
+
+```bash
+bun install
+bun run tui
+bun run typecheck
+bun run build
+```
+
+The only verification gate is `bun run typecheck`. Release Please creates
+versioned release PRs from Conventional Commits. See [`RELEASING.md`](RELEASING.md)
+for the release and Homebrew automation.

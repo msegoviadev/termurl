@@ -3,11 +3,7 @@ termurl
 !skills/
 !skills/termurl/
 !skills/termurl/SKILL.md
-collection/.termurl/
 .DS_Store
 .env
 .env.*
 !.env.example
-!collection/.env.dev
-!collection/.env.staging
-!collection/.env.prod
