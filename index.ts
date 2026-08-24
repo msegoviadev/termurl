@@ -9,7 +9,7 @@ import {
   type KeyEvent,
 } from "@opentui/core";
 import packageJson from "./package.json" with { type: "json" };
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, readdirSync, statSync, rmSync } from "fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, readdirSync, statSync, rmSync, watch } from "fs";
 import { join, relative, resolve } from "path";
 import { homedir, tmpdir } from "os";
 import * as readline from "node:readline/promises";
@@ -205,6 +205,7 @@ type RunResult = {
   captured: Record<string, string>;
   body: string;
   headers: string[];
+  request?: { method: string; url: string; headers: string[] };
   error?: string;
 };
 
@@ -215,6 +216,7 @@ type HurlJson = {
     asserts?: Array<{ success?: boolean; message?: string }>;
     captures?: Array<{ name?: string; value?: string }>;
     calls?: Array<{
+      request?: { method?: string; url?: string; headers?: Array<{ name: string; value: string }> };
       response?: { status?: number; headers?: Array<{ name: string; value: string }> };
       timings?: { total?: number };
     }>;
@@ -234,16 +236,83 @@ function environmentVariables(name: string, collection = COLLECTION): Record<str
   }
 }
 
-function secretVariables(collection = COLLECTION): Record<string, string> {
-  try {
-    return parseVariables(readFileSync(join(collection, ".env"), "utf8"));
-  } catch {
-    return {};
-  }
+function activeVariables(): Record<string, string> {
+  return { ...environmentVariables(environments[environmentIdx]), ...cliVariables };
 }
 
-function activeVariables(): Record<string, string> {
-  return { ...environmentVariables(environments[environmentIdx]), ...secretVariables(), ...cliVariables };
+function renderTemplate(source: string): string {
+  const variables = activeVariables();
+  return source.replace(/\{\{([a-z_][a-z0-9_]*)\}\}/g, (match, key) => variables[key] ?? match);
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+const HTTP_STATUS_LINE = /^HTTP(\/[\d.]+)?\s+\d/;
+
+const SECTION_HEADER = /^\[([A-Za-z]+)\]\s*$/;
+
+function renderCurl(source: string): string | undefined {
+  const lines = source.split(/\r?\n/);
+  let i = 0;
+  while (i < lines.length && (lines[i].trim() === "" || lines[i].trim().startsWith("#"))) i++;
+  const reqLine = lines[i]?.match(/^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(\S+)/);
+  if (!reqLine) return undefined;
+  const [, method, url] = reqLine;
+  i++;
+
+  const headers: [string, string][] = [];
+  while (i < lines.length) {
+    const line = lines[i];
+    if (line.trim() === "" || HTTP_STATUS_LINE.test(line) || SECTION_HEADER.test(line) || line.startsWith("{") || line.startsWith("[")) break;
+    const header = line.match(/^([A-Za-z0-9-]+):\s*(.*)$/);
+    if (header) headers.push([header[1], header[2]]);
+    i++;
+  }
+
+  const queryParams: [string, string][] = [];
+  const formParams: [string, string][] = [];
+  const cookies: [string, string][] = [];
+  let basicAuth: string | undefined;
+
+  let section: string | undefined;
+  while (i < lines.length && (section = lines[i].match(SECTION_HEADER)?.[1])) {
+    i++;
+    const target = section === "QueryStringParams" ? queryParams : section === "FormParams" ? formParams : section === "Cookies" ? cookies : undefined;
+    while (i < lines.length && lines[i].trim() !== "" && !HTTP_STATUS_LINE.test(lines[i]) && !SECTION_HEADER.test(lines[i])) {
+      const pair = lines[i].match(/^([^:]+):\s*(.*)$/);
+      if (pair) {
+        if (target) target.push([pair[1].trim(), pair[2]]);
+        else if (section === "BasicAuth") basicAuth = `${pair[1].trim()}:${pair[2]}`;
+      }
+      i++;
+    }
+    while (i < lines.length && lines[i].trim() === "") i++;
+  }
+
+  let body = "";
+  if (lines[i]?.trim().startsWith("{") || lines[i]?.trim().startsWith("[")) {
+    const bodyLines: string[] = [];
+    while (i < lines.length && !HTTP_STATUS_LINE.test(lines[i])) {
+      bodyLines.push(lines[i]);
+      i++;
+    }
+    body = bodyLines.join("\n").trim();
+  }
+
+  const encodePair = ([key, value]: [string, string]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`;
+  const fullUrl = queryParams.length ? `${url}${url.includes("?") ? "&" : "?"}${queryParams.map(encodePair).join("&")}` : url;
+
+  const parts = ["curl"];
+  if (method !== "GET") parts.push("-X", method);
+  parts.push(shellQuote(fullUrl));
+  for (const [name, value] of headers) parts.push("-H", shellQuote(`${name}: ${value}`));
+  if (cookies.length) parts.push("-H", shellQuote(`Cookie: ${cookies.map(([k, v]) => `${k}=${v}`).join("; ")}`));
+  if (basicAuth) parts.push("-u", shellQuote(basicAuth));
+  if (formParams.length) parts.push("--data", shellQuote(formParams.map(encodePair).join("&")));
+  else if (body) parts.push("--data", shellQuote(body));
+  return parts.join(" ");
 }
 
 function environmentNames(collection = COLLECTION): string[] {
@@ -259,17 +328,21 @@ function environmentNames(collection = COLLECTION): string[] {
 
 function addResponseOutput(source: string, outputFile: string): string {
   const responseIndex = source.search(/^HTTP\s+/m);
-  if (responseIndex < 0) return source;
-  const prefix = source.slice(0, responseIndex);
+  // A request may have no HTTP assertion at all (valid Hurl syntax for "just run it") —
+  // fall back to the end of the request text instead of leaving the body uncaptured.
+  const searchEnd = responseIndex >= 0 ? responseIndex : source.length;
+  const prefix = source.slice(0, searchEnd);
   const bodyMatch = prefix.match(/^\s*(?:\{|<|```|`|base64,|hex,|file,)/m);
-  const insertionIndex = bodyMatch?.index ?? responseIndex;
+  const insertionIndex = bodyMatch?.index ?? searchEnd;
   const optionsIndex = prefix.search(/^\[Options\]\s*$/m);
   if (optionsIndex >= 0 && optionsIndex < insertionIndex) {
     const lineEnd = prefix.indexOf("\n", optionsIndex);
     const insertAt = lineEnd < 0 ? insertionIndex : lineEnd + 1;
     return `${source.slice(0, insertAt)}output: ${outputFile}\n${source.slice(insertAt)}`;
   }
-  return `${source.slice(0, insertionIndex)}[Options]\noutput: ${outputFile}\n${source.slice(insertionIndex)}`;
+  const before = source.slice(0, insertionIndex);
+  const needsNewline = before.length > 0 && !before.endsWith("\n");
+  return `${before}${needsNewline ? "\n" : ""}[Options]\noutput: ${outputFile}\n${source.slice(insertionIndex)}`;
 }
 
 function emptyRunResult(error: string): RunResult {
@@ -293,6 +366,15 @@ function normalizeAssertMessage(message: string): string {
   const caret = lines.find((line) => /\^{2,}/.test(line));
   const detail = caret?.replace(/^.*?\^{2,}\s*/, "").trim();
   return detail ? `${title}: ${detail}` : title;
+}
+
+// Hurl only writes the [Options] output: file when its HTTP status assert passes.
+// On a failing assert it aborts before writing the file, but it still dumps the
+// response (headers + body) to stderr as part of the error report — recover the
+// body from there instead of leaving it empty.
+function extractBodyFromStderr(stderr: string): string {
+  const match = stderr.match(/^HTTP\/[\d.]+\s+\d+.*\n(?:.+\n)*\n([\s\S]*?)\n\nerror:/m);
+  return match?.[1] ?? "";
 }
 
 function prettyBody(body: string): string {
@@ -349,6 +431,7 @@ async function runHurl(requestsToRun: Req[]): Promise<RunResult[]> {
       const bodyPath = join(tempDir, outputFiles[index]);
       let body = "";
       try { body = readFileSync(bodyPath, "utf8"); } catch {}
+      if (!body && call?.response) body = extractBodyFromStderr(stderr);
       const status = call?.response?.status ?? 0;
       const error = failedAsserts.join("\n\n") || (!call ? normalizeHurlError(processError) : undefined);
       const captured = Object.fromEntries(
@@ -365,6 +448,13 @@ async function runHurl(requestsToRun: Req[]): Promise<RunResult[]> {
         captured,
         headers: call?.response?.headers?.map((header) => `${header.name}: ${header.value}`) ?? [],
         body,
+        ...(call?.request ? {
+          request: {
+            method: call.request.method ?? "",
+            url: call.request.url ?? "",
+            headers: call.request.headers?.map((header) => `${header.name}: ${header.value}`) ?? [],
+          },
+        } : {}),
         ...(error ? { error } : {}),
       };
     });
@@ -477,8 +567,7 @@ function envShowCommand(name: string | undefined, reveal: boolean, json: boolean
     return 1;
   }
   const values = new Map<string, { value: string; source: string; secret: boolean }>();
-  for (const [key, value] of Object.entries(environmentVariables(name))) values.set(key, { value, source: `.env.${name}`, secret: false });
-  for (const [key, value] of Object.entries(secretVariables())) values.set(key, { value, source: ".env", secret: true });
+  for (const [key, value] of Object.entries(environmentVariables(name))) values.set(key, { value, source: `.env.${name}`, secret: /^secret_/i.test(key) });
   const variables = [...values.entries()].map(([key, item]) => ({
     key,
     value: item.secret && !reveal ? "***" : item.value,
@@ -672,6 +761,7 @@ type HistoryRecord = {
   step?: number;
   flow_size?: number;
   captures?: string[];
+  request_detail?: string;
   response?: string;
   error?: string;
 };
@@ -687,6 +777,7 @@ type HistoryGroup = {
 let historyGroups: HistoryGroup[] = [];
 let selectedHistory = 0;
 let selectedEnvironment = 0;
+let secretsRevealed = false;
 
 type TreeRow =
   | { type: "folder"; path: string; name: string; depth: number }
@@ -725,7 +816,7 @@ const main = new BoxRenderable(renderer, { flexDirection: "row", flexGrow: 1 });
 root.add(main);
 
 const listBox = new BoxRenderable(renderer, {
-  width: 36, border: true, borderStyle: "single", title: " REQUESTS ", flexDirection: "column",
+  width: "33%", flexShrink: 0, border: true, borderStyle: "single", title: " REQUESTS ", flexDirection: "column",
   borderColor: C.dim, backgroundColor: C.bg,
 });
 main.add(listBox);
@@ -740,11 +831,12 @@ const treeList = new BoxRenderable(renderer, {
 });
 listBox.add(treeList);
 
-const rightCol = new BoxRenderable(renderer, { flexDirection: "column", flexGrow: 1 });
+const rightCol = new BoxRenderable(renderer, { flexDirection: "column", flexGrow: 1, flexBasis: 0 });
 main.add(rightCol);
 
 const editorBox = new BoxRenderable(renderer, {
   height: "55%", border: true, borderStyle: "single", title: " REQUEST ", borderColor: C.dim, backgroundColor: C.bg,
+  padding: 1,
 });
 rightCol.add(editorBox);
 
@@ -757,6 +849,7 @@ editorBox.add(editor);
 
 const responseBox = new BoxRenderable(renderer, {
   flexGrow: 1, border: true, borderStyle: "single", title: " RESPONSE ", borderColor: C.dim, backgroundColor: C.bg,
+  padding: 1,
 });
 rightCol.add(responseBox);
 
@@ -764,8 +857,7 @@ const respView = new TextareaRenderable(renderer, {
   backgroundColor: C.bg,
   textColor: C.fg,
   selectable: true,
-  width: "100%",
-  height: "100%",
+  flexGrow: 1,
 });
 respView.setText("run a request with enter");
 respView.onKeyDown = (key) => key.preventDefault();
@@ -861,6 +953,25 @@ envDetailBox.add(envDetail);
 envWindow.visible = false;
 root.add(statusBar);
 
+const helpBackdrop = new BoxRenderable(renderer, {
+  position: "absolute", top: 0, left: 0, width: "100%", height: "100%",
+  backgroundColor: C.bg, zIndex: 99, visible: false,
+});
+root.add(helpBackdrop);
+
+const helpOverlay = new BoxRenderable(renderer, {
+  position: "absolute", top: "20%", left: "10%", width: "80%", height: "45%",
+  border: true, borderStyle: "single", title: " SHORTCUTS (press any key to close) ",
+  borderColor: C.yellow, backgroundColor: C.bg, zIndex: 100, visible: false,
+  padding: 1,
+});
+root.add(helpOverlay);
+
+const helpText = new TextareaRenderable(renderer, { backgroundColor: C.bg, textColor: C.fg, selectable: false, flexGrow: 1 });
+helpText.onKeyDown = (key) => key.preventDefault();
+helpText.onPaste = (event) => event.preventDefault();
+helpOverlay.add(helpText);
+
 listBox.onMouseDown = () => { if (appWindow === "workspace" && pane !== "list") setPane("list"); };
 editorBox.onMouseDown = () => { if (appWindow === "workspace" && pane !== "editor") setPane("editor"); };
 responseBox.onMouseDown = () => { if (appWindow === "workspace" && pane !== "response") setPane("response"); };
@@ -950,8 +1061,7 @@ function availableCaptures(req: Req | null): Set<string> {
 
 function variableSource(name: string, req: Req | null = currentReq(), environment = environments[environmentIdx]): VariableSource {
   if (availableCaptures(req).has(name)) return "capture";
-  if (secretVariables()[name] !== undefined) return "secret";
-  if (environmentVariables(environment)[name] !== undefined) return "file";
+  if (environmentVariables(environment)[name] !== undefined) return /^secret_/i.test(name) ? "secret" : "file";
   return "unresolved";
 }
 
@@ -961,9 +1071,20 @@ function renderTabs() {
 }
 
 function envTitle(state: "list" | "editor" | "insert"): string {
-  if (state === "insert") return " ENVIRONMENT (INSERT · ctrl-s save · esc normal) ";
-  if (state === "editor") return " ENVIRONMENT (i edit · ctrl-s save · esc list) ";
-  return ` ENVIRONMENT (.env.${environments[selectedEnvironment]}) `;
+  const base = `ENVIRONMENT (.env.${environments[selectedEnvironment]})`;
+  if (state === "insert") return ` ${base} · INSERT `;
+  if (state === "editor") return ` ${base} `;
+  const text = environmentVariables(environments[selectedEnvironment]);
+  const hasSecrets = Object.keys(text).some((key) => /^secret_/i.test(key));
+  if (hasSecrets) return ` ${base} ${secretsRevealed ? "[revealed]" : "[masked]"} `;
+  return ` ${base} `;
+}
+
+function maskSecretsText(text: string): string {
+  return text.split("\n").map((line) => {
+    const match = line.match(/^(\s*(secret_\w*)\s*=\s*)(.*)$/i);
+    return match && match[3].trim() ? `${match[1]}***` : line;
+  }).join("\n");
 }
 
 function renderEnvironments() {
@@ -994,19 +1115,17 @@ function renderEnvironments() {
 }
 
 function loadEnvironmentFile() {
-  try {
-    envDetail.setText(readFileSync(environmentFile(environments[selectedEnvironment]), "utf8"));
-  } catch {
-    envDetail.setText("");
-  }
+  let text = "";
+  try { text = readFileSync(environmentFile(environments[selectedEnvironment]), "utf8"); } catch {}
+  envDetail.setText(envPane === "list" && !secretsRevealed ? maskSecretsText(text) : text);
   if (envPane === "list" && !envInsert) envDetailBox.title = envTitle("list");
 }
 
 function saveEnvironmentFile() {
   const name = environments[selectedEnvironment];
   writeFileSync(environmentFile(name), envDetail.plainText);
-  refreshEditorHighlights();
   statusMsg = `saved .env.${name}`;
+  refreshEditorHighlights();
   setStatus();
   setTimeout(() => { statusMsg = ""; setStatus(); }, 2000);
 }
@@ -1033,6 +1152,7 @@ function setEnvPane(next: EnvPane) {
   envPane = next;
   envListBox.borderColor = next === "list" ? C.yellow : C.dim;
   envDetailBox.borderColor = next === "editor" ? C.yellow : C.dim;
+  loadEnvironmentFile();
   envDetailBox.title = envTitle(next);
   if (next === "editor") envDetail.focus();
   else envDetail.blur();
@@ -1091,6 +1211,7 @@ function historyDetailText(group: HistoryGroup | undefined): string {
     lines.push(`${index + 1}. ${step.request} · ${step.status} · ${step.duration_ms}ms`);
     if (step.error && !step.response?.includes("reason:")) lines.push("reason:", step.error);
     if (step.captures?.length) lines.push(`   captures: ${step.captures.join(", ")}`);
+    if (step.request_detail) lines.push("", "request:", step.request_detail);
     if (step.response) lines.push("", step.response);
     lines.push("");
   }
@@ -1172,6 +1293,7 @@ function recordHistory(req: Req, result: RunResult, flowId?: string, step?: numb
     success: result.success,
     duration_ms: result.ms,
     captures: result.captures,
+    ...(formatRequest(result) ? { request_detail: redactResponse(formatRequest(result)!) } : {}),
     response: redactResponse(formatRun(req, result)),
     ...(result.error ? { error: result.error } : {}),
     ...(flowId ? { flow_id: flowId, step, flow_size: flowSize } : {}),
@@ -1266,7 +1388,7 @@ function renderTree() {
   });
 }
 
-function refreshList(keepName?: string) {
+function refreshList(keepName?: string, touchEditor = true) {
   const previous = currentReq()?.name;
   const q = filterInput.value.toLowerCase();
   const filtered = requests.filter((r) => r.name.toLowerCase().includes(q));
@@ -1278,11 +1400,24 @@ function refreshList(keepName?: string) {
   }
   selectedRow = Math.max(0, Math.min(selectedRow, Math.max(0, treeRows.length - 1)));
   const req = currentReq();
-  if (req) {
+  if (req && touchEditor) {
     editor.setText(readFileSync(req.file, "utf8"));
     refreshEditorHighlights();
   }
   renderTree();
+}
+
+function watchCollection() {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    watch(COLLECTION, { recursive: true }, () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        requests.splice(0, requests.length, ...loadRequests());
+        refreshList(undefined, appWindow === "workspace" && !insert);
+      }, 150);
+    });
+  } catch {}
 }
 
 function moveSelection(delta: number) {
@@ -1361,8 +1496,8 @@ function setPane(p: Pane) {
   editorBox.borderColor = p === "editor" ? C.yellow : C.dim;
   responseBox.borderColor = p === "response" ? C.yellow : C.dim;
   listBox.title = " REQUESTS ";
-  editorBox.title = p === "editor" ? " REQUEST (i edit · ctrl-s save · esc list) " : " REQUEST ";
-  responseBox.title = p === "response" ? " RESPONSE (hjkl · v/V select · y copy · s save body) " : " RESPONSE ";
+  editorBox.title = " REQUEST ";
+  responseBox.title = " RESPONSE ";
   if (p === "editor") editor.focus();
   else editor.blur();
   if (p === "response") respView.focus();
@@ -1376,7 +1511,7 @@ function setHistoryPane(next: HistoryPane) {
   historyPane = next;
   historyListBox.borderColor = next === "list" ? C.yellow : C.dim;
   historyDetailBox.borderColor = next === "detail" ? C.yellow : C.dim;
-  historyDetailBox.title = next === "detail" ? " RUN DETAILS (hjkl · v/V select · y copy · esc list) " : " RUN DETAILS ";
+  historyDetailBox.title = " RUN DETAILS ";
   if (next === "detail") historyDetail.focus();
   else historyDetail.blur();
   setStatus();
@@ -1427,9 +1562,16 @@ function moveHistory(delta: number) {
   renderHistory();
 }
 
+function formatRequest(r: RunResult): string | undefined {
+  if (!r.request) return undefined;
+  return `${r.request.method} ${r.request.url}` + (r.request.headers.length ? `\n${r.request.headers.join("\n")}` : "");
+}
+
 function formatRun(req: Req, r: RunResult): string {
   const ok = r.success;
+  const request = formatRequest(r);
   return `${ok ? "✓" : "✗"} ${r.status} ${ok ? "OK" : "FAILED"} · ${r.ms}ms · env: ${environments[environmentIdx]}\n` +
+    (request ? `${request}\n\n` : "") +
     `asserts: ${r.asserts.passed}/${r.asserts.total} passed · captures: ${r.captures.join(", ") || "-"}\n\n` +
     (r.headers.length ? `headers:\n${r.headers.join("\n")}\n\n` : "") +
     (r.error ? `reason:\n${r.error}\n\n` : "") +
@@ -1481,7 +1623,7 @@ async function runFlow() {
   setStatus();
 }
 
-function enterInsert(title = " REQUEST (INSERT · esc normal) ") {
+function enterInsert(title = " REQUEST (INSERT) ") {
   insert = true;
   pending = null;
   editorBox.title = title;
@@ -1491,7 +1633,7 @@ function enterInsert(title = " REQUEST (INSERT · esc normal) ") {
 function leaveInsert() {
   insert = false;
   pending = null;
-  editorBox.title = " REQUEST (i edit · ctrl-s save · esc list) ";
+  editorBox.title = " REQUEST ";
   setStatus();
 }
 
@@ -1659,22 +1801,120 @@ function saveEditor() {
   setTimeout(() => { statusMsg = ""; setStatus(); }, 2000);
 }
 
-const TUI_HELP = `termurl keys
-  windows: 1 workspace · 2 history · 3 environments (NORMAL mode)
-  list:  j/k move · ctrl-d/u page · / filter · enter run/collapse · tab queue/unqueue
-         ctrl-enter flow · ctrl-f flow
-         e request pane · i edit now · ctrl-n new · ctrl-x delete · ctrl-p environment · q quit
-  panes: ctrl-l next (list -> request -> response) · ctrl-h prev · esc back to list
-  req:   NORMAL hjkl/w/b/g/G move · v/V visual · i insert · INSERT esc normal · ctrl-s save
-  resp:  NORMAL hjkl/w/b/g/G · v/V visual · yy line · Y all · c copy mouse selection · s save body to file
-  hist:  j/k move · enter/ctrl-l details · ctrl-h/esc list · y copy all
-         details: NORMAL hjkl/w/b/g/G · v/V visual · y selection · yy line · Y all
-   env:  j/k move · enter activate · ctrl-l/e env file · ctrl-h/esc list · i insert when focused · ctrl-s save · q quit`;
+const VIM_MOVE: [string, string][] = [
+  ["hjkl / w / b", "move / word forward / back"],
+  ["0 / $", "start / end of line"],
+  ["gg / G", "top / bottom"],
+  ["ctrl-d / ctrl-u", "page down / up"],
+];
 
-let helpOn = false;
+const VIM_EDIT: [string, string][] = [
+  ["v / V", "visual char / line"],
+  ["i / a", "insert before / after cursor"],
+  ["I / A", "insert at line start / end"],
+  ["o / O", "new line below / above"],
+  ["x", "delete char"],
+  ["dd / D", "delete line / to end of line"],
+  ["cc / C", "change line / to end of line"],
+  ["yy / Y", "yank line / yank whole buffer"],
+  ["p", "paste"],
+  ["u / ctrl-r", "undo / redo"],
+];
+
+const PANE_HELP: Record<string, [string, string][]> = {
+  list: [
+    ["j / k", "move down / up"],
+    ["gg / G", "jump to top / bottom"],
+    ["ctrl-d / ctrl-u", "page down / up"],
+    ["/", "filter"],
+    ["enter", "run request / toggle folder"],
+    ["ctrl-enter / ctrl-f", "run flow"],
+    ["tab", "queue/unqueue for flow"],
+    ["e / i / ctrl-l", "open request pane"],
+    ["y", "copy as hurl"],
+    ["Y", "copy as curl"],
+    ["ctrl-n", "new request"],
+    ["ctrl-x", "delete request"],
+    ["ctrl-p", "cycle environment"],
+    ["q", "quit"],
+  ],
+  editor: [
+    ...VIM_MOVE,
+    ...VIM_EDIT,
+    ["ctrl-s", "save"],
+    ["ctrl-l / ctrl-h", "next pane (response) / prev pane (list)"],
+    ["esc", "leave insert / cancel visual / back to list"],
+  ],
+  response: [
+    ...VIM_MOVE,
+    ["v / V", "visual char / line"],
+    ["yy / Y", "yank line / yank all"],
+    ["c", "copy mouse selection"],
+    ["s", "save body to file"],
+    ["ctrl-p", "cycle environment"],
+    ["ctrl-h", "back to request pane"],
+    ["esc", "cancel visual"],
+  ],
+  "history-list": [
+    ["j / k", "move"],
+    ["g / G", "jump to top / bottom"],
+    ["ctrl-d / ctrl-u", "jump 5 up / down"],
+    ["enter / ctrl-l", "open details"],
+    ["y", "copy all"],
+    ["esc", "back to workspace"],
+    ["q", "quit"],
+  ],
+  "history-detail": [
+    ...VIM_MOVE,
+    ["v / V", "visual char / line"],
+    ["y", "yank selection"],
+    ["yy / Y", "yank line / yank all"],
+    ["ctrl-h / esc", "back to list"],
+  ],
+  "env-list": [
+    ["j / k", "move"],
+    ["enter", "activate environment"],
+    ["e / i / ctrl-l", "open file for editing"],
+    ["ctrl-r", "reveal/mask secrets"],
+    ["esc / 1", "back to workspace"],
+    ["q", "quit"],
+  ],
+  "env-editor": [
+    ...VIM_MOVE,
+    ...VIM_EDIT,
+    ["ctrl-s", "save"],
+    ["ctrl-h", "back to list"],
+    ["esc", "leave insert / cancel visual / back to list"],
+  ],
+};
+
+function formatHelp(context: string): string {
+  const rows = PANE_HELP[context];
+  const width = Math.max(...rows.map(([key]) => key.length));
+  return rows.map(([key, desc]) => `${key.padEnd(width)} : ${desc}`).join("\n");
+}
+
+function helpContext(): keyof typeof PANE_HELP {
+  if (appWindow === "history") return historyPane === "detail" ? "history-detail" : "history-list";
+  if (appWindow === "environments") return envPane === "editor" ? "env-editor" : "env-list";
+  if (pane === "editor") return "editor";
+  if (pane === "response") return "response";
+  return "list";
+}
+
+let helpVisible = false;
+function hideHelp() { helpVisible = false; helpBackdrop.visible = false; helpOverlay.visible = false; }
+function showHelp() {
+  helpVisible = true;
+  helpText.setText(formatHelp(helpContext()));
+  helpBackdrop.visible = true;
+  helpOverlay.visible = true;
+}
+
 renderer.keyInput.on("keypress", (key: KeyEvent) => {
   const k = key.name;
-  if (helpOn) { helpOn = false; respView.setText(""); setStatus(); key.preventDefault(); return; }
+  if (helpVisible) { hideHelp(); setStatus(); key.preventDefault(); return; }
+  if (k === "?" && !insert && !envInsert && !filterInputFocused()) { showHelp(); key.preventDefault(); return; }
 
   if (!insert && !envInsert && !visual && !pending && !listPending && !filterInputFocused()) {
     if (k === "1") { setWindow("workspace"); key.preventDefault(); return; }
@@ -1720,7 +1960,7 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
       setEnvPane("editor");
       key.preventDefault(); return;
     }
-    if (k === "?") { envDetail.setText(TUI_HELP); key.preventDefault(); return; }
+    if (k === "r" && key.ctrl) { secretsRevealed = !secretsRevealed; renderEnvironments(); loadEnvironmentFile(); key.preventDefault(); return; }
     key.preventDefault();
     return;
   }
@@ -1746,7 +1986,6 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
       statusMsg = `copied history (${copyToClipboard(renderer, historyDetail.plainText)})`;
       setStatus(); key.preventDefault(); return;
     }
-    if (k === "?") { historyDetail.setText(TUI_HELP); key.preventDefault(); return; }
     key.preventDefault();
     return;
   }
@@ -1767,7 +2006,6 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
   }
 
   if (k === "q" && pane === "list" && !filterInputFocused()) { renderer.destroy(); process.exit(0); }
-  if (k === "?" && pane === "list") { helpOn = true; respView.setText(TUI_HELP); key.preventDefault(); return; }
   if (k === "l" && key.ctrl) { setPane(pane === "list" ? "editor" : "response"); key.preventDefault(); return; }
   if (k === "h" && key.ctrl) { setPane(pane === "response" ? "editor" : "list"); key.preventDefault(); return; }
   if (visual && k === "escape") { clearVisual(); setStatus(); key.preventDefault(); return; }
@@ -1831,6 +2069,21 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
       }
       key.preventDefault(); return;
     }
+    if (k === "y" && !key.shift) {
+      const r = currentReq();
+      if (r) {
+        const rendered = renderTemplate(readFileSync(r.file, "utf8")).replace(/\n?$/, "\n");
+        const cmd = `hurl <<'HURL_EOF'\n${rendered}HURL_EOF`;
+        statusMsg = `copied hurl command (${copyToClipboard(renderer, cmd)})`;
+      }
+      setStatus(); key.preventDefault(); return;
+    }
+    if (k === "Y" || (k === "y" && key.shift)) {
+      const r = currentReq();
+      const cmd = r ? renderCurl(renderTemplate(readFileSync(r.file, "utf8"))) : undefined;
+      statusMsg = cmd ? `copied curl (${copyToClipboard(renderer, cmd)})` : "couldn't build a curl command for this request";
+      setStatus(); key.preventDefault(); return;
+    }
   }
 
   if (pane === "response") {
@@ -1892,4 +2145,5 @@ if (requests.length === 0) statusMsg = `no .hurl files found in ${COLLECTION}`;
 setStatus();
 setWindow("workspace");
 setPane("list");
+watchCollection();
 renderer.start();

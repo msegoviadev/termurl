@@ -70,10 +70,14 @@ Useful controls:
 - `j/k`: navigate lists and move the cursor in NORMAL mode.
 - `v/V`: enter character or line visual selection.
 - `yy`: copy the selected line; `Y`: copy the whole buffer.
+- In the request list: `y` copies the request as a runnable Hurl command
+  and `Y` copies it as a runnable `curl` command, both with all
+  `{{variables}}` rendered to their active values so you can paste and run
+  them in any other terminal.
 - `s`: save the complete response body to `.termurl/bodies/`.
 - `i`: enter INSERT mode in an editor; `ctrl-s`: save the file.
 - `ctrl-p`: cycle environments.
-- `?`: show context-sensitive help; `q`: quit.
+- `?`: show shortcuts for the current pane; `q`: quit.
 
 Mouse support includes pane focus, cursor positioning, row selection, folder
 expansion, double-click queue toggling, and drag selection in text areas.
@@ -86,6 +90,27 @@ to the useful failure detail instead of showing Hurl's temporary source file.
 
 Agents should use subcommands instead of driving the TUI. The minimum workflow
 is documented in [`skills/termurl/SKILL.md`](skills/termurl/SKILL.md).
+
+### Install the skill
+
+No clone needed, just fetch the single `SKILL.md` file.
+
+Claude Code:
+
+```bash
+mkdir -p ~/.claude/skills/termurl
+curl -fsSL https://raw.githubusercontent.com/msegoviadev/termurl/main/skills/termurl/SKILL.md \
+  -o ~/.claude/skills/termurl/SKILL.md
+```
+
+OpenCode (requires the `opencode-skills` plugin enabled in `opencode.jsonc`,
+e.g. `"plugin": ["opencode-skills"]`):
+
+```bash
+mkdir -p ~/.config/opencode/skills/termurl
+curl -fsSL https://raw.githubusercontent.com/msegoviadev/termurl/main/skills/termurl/SKILL.md \
+  -o ~/.config/opencode/skills/termurl/SKILL.md
+```
 
 ### Preflight
 
