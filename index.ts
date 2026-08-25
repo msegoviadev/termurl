@@ -205,7 +205,7 @@ type RunResult = {
   captured: Record<string, string>;
   body: string;
   headers: string[];
-  request?: { method: string; url: string; headers: string[] };
+  request?: { method: string; url: string; headers: string[]; body?: string };
   error?: string;
 };
 
@@ -220,6 +220,7 @@ type HurlJson = {
       response?: { status?: number; headers?: Array<{ name: string; value: string }> };
       timings?: { total?: number };
     }>;
+    curl_cmd?: string;
     time?: number;
   }>;
 };
@@ -377,6 +378,16 @@ function extractBodyFromStderr(stderr: string): string {
   return match?.[1] ?? "";
 }
 
+// hurl's --json report never includes a request body field, but the rendered curl
+// reproduction (curl_cmd) does, with all {{variables}} already substituted.
+// ponytail: naive single-quote scanning, no shell-unescaping - fine for JSON bodies
+// that never contain a literal '; revisit only if that stops holding.
+function extractRequestBodyFromCurlCmd(curlCmd?: string): string | undefined {
+  if (!curlCmd) return undefined;
+  const matches = [...curlCmd.matchAll(/--(?:form|data|data-raw) '([^']*)'/g)].map((m) => m[1]);
+  return matches.length ? matches.join("\n") : undefined;
+}
+
 function prettyBody(body: string): string {
   const trimmed = body.trim();
   if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return body;
@@ -453,6 +464,7 @@ async function runHurl(requestsToRun: Req[]): Promise<RunResult[]> {
             method: call.request.method ?? "",
             url: call.request.url ?? "",
             headers: call.request.headers?.map((header) => `${header.name}: ${header.value}`) ?? [],
+            body: extractRequestBodyFromCurlCmd(entry?.curl_cmd),
           },
         } : {}),
         ...(error ? { error } : {}),
@@ -996,15 +1008,14 @@ const variableSyntax = SyntaxStyle.fromStyles({
 
 const responseFailureSyntax = SyntaxStyle.fromStyles({
   failure: { fg: C.red },
+  label: { fg: C.cyan, bold: true },
 });
 
-function applyFailureHighlights(target: TextareaRenderable, text: string, failed: boolean) {
+function applyResponseHighlights(target: TextareaRenderable, text: string, failed: boolean) {
   target.editBuffer.setSyntaxStyle(responseFailureSyntax);
   target.editBuffer.clearAllHighlights();
-  if (!failed) return;
 
-  const styleId = responseFailureSyntax.getStyleId("failure") ?? 0;
-  const highlightRange = (start: number, end: number) => {
+  const highlightRange = (start: number, end: number, styleId: number) => {
     let lineStart = 0;
     for (const [line, content] of text.split("\n").entries()) {
       const lineEnd = lineStart + content.length;
@@ -1021,6 +1032,28 @@ function applyFailureHighlights(target: TextareaRenderable, text: string, failed
     }
   };
 
+  const labelStyleId = responseFailureSyntax.getStyleId("label") ?? 0;
+  for (const label of ["REQUEST", "RESPONSE", "ASSERTIONS"]) {
+    let searchFrom = 0;
+    while (true) {
+      const start = text.indexOf(`${label}\n`, searchFrom);
+      if (start < 0) break;
+      highlightRange(start, start + label.length, labelStyleId);
+      searchFrom = start + label.length;
+    }
+  }
+
+  // Per-step heading in a multi-request flow (e.g. "▸ 2. notification-send-push"),
+  // highlighted the same as section labels so it's not lost after a long response body.
+  let lineStart = 0;
+  for (const content of text.split("\n")) {
+    if (/^▸ \d+\.\s.+$/.test(content)) highlightRange(lineStart, lineStart + content.length, labelStyleId);
+    lineStart += content.length + 1;
+  }
+
+  if (!failed) return;
+
+  const styleId = responseFailureSyntax.getStyleId("failure") ?? 0;
   let searchFrom = 0;
   let highlighted = false;
   while (true) {
@@ -1028,16 +1061,16 @@ function applyFailureHighlights(target: TextareaRenderable, text: string, failed
     if (start < 0) break;
     const blankLine = text.indexOf("\n\n", start);
     const end = blankLine < 0 ? text.length : blankLine;
-    highlightRange(start, end);
+    highlightRange(start, end, styleId);
     highlighted = true;
     searchFrom = end + 2;
   }
-  if (!highlighted) highlightRange(0, text.length);
+  if (!highlighted) highlightRange(0, text.length, styleId);
 }
 
 function renderResponse(text: string, failed: boolean) {
   respView.setText(text);
-  applyFailureHighlights(respView, text, failed);
+  applyResponseHighlights(respView, text, failed);
 }
 
 function captureNames(req: Req): string[] {
@@ -1243,7 +1276,7 @@ function renderHistory() {
   const group = historyGroups[selectedHistory];
   const text = historyDetailText(group);
   historyDetail.setText(text);
-  applyFailureHighlights(historyDetail, text, Boolean(group?.steps.some((step) => step.error || step.status >= 400)));
+  applyResponseHighlights(historyDetail, text, Boolean(group?.steps.some((step) => step.error || step.status >= 400)));
 }
 
 function loadHistory() {
@@ -1562,20 +1595,29 @@ function moveHistory(delta: number) {
   renderHistory();
 }
 
+function indent(text: string): string {
+  return text.split("\n").map((line) => `  ${line}`).join("\n");
+}
+
 function formatRequest(r: RunResult): string | undefined {
   if (!r.request) return undefined;
-  return `${r.request.method} ${r.request.url}` + (r.request.headers.length ? `\n${r.request.headers.join("\n")}` : "");
+  return `REQUEST\n${r.request.method} ${r.request.url}` +
+    (r.request.headers.length ? `\n  headers:\n${indent(indent(r.request.headers.join("\n")))}` : "") +
+    (r.request.body ? `\n  body:\n${indent(indent(formatBody(r.request.body)))}` : "");
 }
 
 function formatRun(req: Req, r: RunResult): string {
   const ok = r.success;
   const request = formatRequest(r);
-  return `${ok ? "✓" : "✗"} ${r.status} ${ok ? "OK" : "FAILED"} · ${r.ms}ms · env: ${environments[environmentIdx]}\n` +
+  return `${ok ? "✓" : "✗"} ${r.status} ${ok ? "OK" : "FAILED"} · ${r.ms}ms · env: ${environments[environmentIdx]}\n\n` +
     (request ? `${request}\n\n` : "") +
-    `asserts: ${r.asserts.passed}/${r.asserts.total} passed · captures: ${r.captures.join(", ") || "-"}\n\n` +
-    (r.headers.length ? `headers:\n${r.headers.join("\n")}\n\n` : "") +
-    (r.error ? `reason:\n${r.error}\n\n` : "") +
-    (r.body ? formatBody(r.body) : "(empty response body)");
+    `RESPONSE\n` +
+    (r.headers.length ? `  headers:\n${indent(indent(r.headers.join("\n")))}\n\n` : "") +
+    `  body:\n` +
+    (r.body ? indent(indent(formatBody(r.body))) : "    (empty response body)") +
+    `\n\nASSERTIONS\n` +
+    `  ${r.asserts.passed}/${r.asserts.total} passed · captures: ${r.captures.join(", ") || "-"}\n` +
+    (r.error ? `\n  reason:\n${indent(indent(r.error))}` : "");
 }
 
 async function runRequest(req: Req) {
@@ -1616,7 +1658,7 @@ async function runFlow() {
     recordHistory(req, r, flowId, index + 1, targets.length);
     return `▸ ${index + 1}. ${req.name}\n${response}`;
   });
-  renderResponse(`flow (env: ${environments[environmentIdx]}), ${targets.length} requests\n\n` + parts.join("\n\n"), results.some((result) => !result.success));
+  renderResponse(`flow (env: ${environments[environmentIdx]}), ${targets.length} requests\n\n` + parts.join(`\n\n${"─".repeat(60)}\n\n`), results.some((result) => !result.success));
   refreshEditorHighlights();
   refreshList(currentReq()?.name);
   statusMsg = "";
