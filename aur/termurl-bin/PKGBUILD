@@ -1,0 +1,23 @@
+# Maintainer: msegoviadev <https://github.com/msegoviadev>
+
+pkgname=termurl-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Terminal client for Hurl collections with an agent-friendly headless CLI"
+arch=('x86_64' 'aarch64')
+url="https://github.com/msegoviadev/termurl"
+license=('MIT')
+depends=('hurl>=8')
+provides=('termurl')
+conflicts=('termurl')
+# bun build --compile embeds the application bundle in the binary;
+# strip removes it and the result silently degrades to a bare bun runtime
+options=('!strip' '!debug')
+source_x86_64=("${pkgname}-${pkgver}-x86_64::${url}/releases/download/v${pkgver}/termurl-linux-x64")
+source_aarch64=("${pkgname}-${pkgver}-aarch64::${url}/releases/download/v${pkgver}/termurl-linux-arm64")
+sha256sums_x86_64=('ad4ce461b65478b7ae669bb4796083a5cc8e492cadc5e98f23ffa1c1353e0ff9')
+sha256sums_aarch64=('912f6c58065fdf35b9c8421b19ccc56a27deb3e9d6af3d57de0c815f1dd85b05')
+
+package() {
+  install -Dm755 "${srcdir}/${pkgname}-${pkgver}-${CARCH}" "${pkgdir}/usr/bin/termurl"
+}

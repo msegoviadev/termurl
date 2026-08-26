@@ -25,6 +25,17 @@ brew tap msegoviadev/tap
 brew install termurl
 ```
 
+On Arch Linux and Omarchy, install the `termurl-bin` AUR package:
+
+```bash
+yay -S termurl-bin
+
+# or on Omarchy
+omarchy pkg aur add termurl-bin
+```
+
+The AUR package pulls in `hurl` as a dependency.
+
 Or build from source:
 
 ```bash

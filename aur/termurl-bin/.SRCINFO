@@ -1,0 +1,19 @@
+pkgbase = termurl-bin
+	pkgdesc = Terminal client for Hurl collections with an agent-friendly headless CLI
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/msegoviadev/termurl
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	depends = hurl>=8
+	provides = termurl
+	conflicts = termurl
+	options = !strip
+	options = !debug
+	source_x86_64 = termurl-bin-0.1.0-x86_64::https://github.com/msegoviadev/termurl/releases/download/v0.1.0/termurl-linux-x64
+	sha256sums_x86_64 = ad4ce461b65478b7ae669bb4796083a5cc8e492cadc5e98f23ffa1c1353e0ff9
+	source_aarch64 = termurl-bin-0.1.0-aarch64::https://github.com/msegoviadev/termurl/releases/download/v0.1.0/termurl-linux-arm64
+	sha256sums_aarch64 = 912f6c58065fdf35b9c8421b19ccc56a27deb3e9d6af3d57de0c815f1dd85b05
+
+pkgname = termurl-bin
