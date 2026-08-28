@@ -736,7 +736,7 @@ function copyToClipboard(renderer: any, text: string): string {
   return ok || via === "pbcopy" ? via : "failed";
 }
 
-const renderer = await createCliRenderer({ useMouse: true, useAlternateScreen: true } as any);
+const renderer = await createCliRenderer({ useMouse: true, enableMouseMovement: true, useAlternateScreen: true } as any);
 renderer.setBackgroundColor(C.bg);
 
 const flowQueue = new Map<string, number>();
@@ -827,13 +827,23 @@ root.add(tabBar);
 const main = new BoxRenderable(renderer, { flexDirection: "row", flexGrow: 1 });
 root.add(main);
 
+let sidebarSplit = 33;
+let editorSplit = 55;
+let historySplit = 44;
+let environmentSplit = 32;
+
 const listBox = new BoxRenderable(renderer, {
-  width: "33%", flexShrink: 0, border: true, borderStyle: "single", title: " REQUESTS ", flexDirection: "column",
+  width: `${sidebarSplit}%`, flexShrink: 0, border: true, borderStyle: "single", title: " REQUESTS ", flexDirection: "column",
   borderColor: C.dim, backgroundColor: C.bg,
 });
 main.add(listBox);
 
-const filterInput = new InputRenderable(renderer, { placeholder: "/ filter", backgroundColor: C.bg, textColor: C.fg });
+const verticalDivider = new BoxRenderable(renderer, {
+  width: 1, flexShrink: 0, backgroundColor: C.bg, selectable: false,
+} as any);
+main.add(verticalDivider);
+
+const filterInput = new InputRenderable(renderer, { placeholder: "/ filter", backgroundColor: "transparent", textColor: C.fg });
 listBox.add(filterInput);
 
 const treeList = new BoxRenderable(renderer, {
@@ -847,7 +857,7 @@ const rightCol = new BoxRenderable(renderer, { flexDirection: "column", flexGrow
 main.add(rightCol);
 
 const editorBox = new BoxRenderable(renderer, {
-  height: "55%", border: true, borderStyle: "single", title: " REQUEST ", borderColor: C.dim, backgroundColor: C.bg,
+  height: `${editorSplit}%`, border: true, borderStyle: "single", title: " REQUEST ", borderColor: C.dim, backgroundColor: C.bg,
   padding: 1,
 });
 rightCol.add(editorBox);
@@ -855,9 +865,15 @@ rightCol.add(editorBox);
 const editor = new TextareaRenderable(renderer, {
   initialValue: requests[0] ? readFileSync(requests[0].file, "utf8") : "",
   backgroundColor: C.bg, textColor: C.fg,
+  width: "100%", height: "100%",
   selectable: true,
 });
 editorBox.add(editor);
+
+const horizontalDivider = new BoxRenderable(renderer, {
+  height: 1, flexShrink: 0, backgroundColor: C.bg, selectable: false,
+} as any);
+rightCol.add(horizontalDivider);
 
 const responseBox = new BoxRenderable(renderer, {
   flexGrow: 1, border: true, borderStyle: "single", title: " RESPONSE ", borderColor: C.dim, backgroundColor: C.bg,
@@ -868,6 +884,7 @@ rightCol.add(responseBox);
 const respView = new TextareaRenderable(renderer, {
   backgroundColor: C.bg,
   textColor: C.fg,
+  width: "100%", height: "100%",
   selectable: true,
   flexGrow: 1,
 });
@@ -886,7 +903,7 @@ const historyWindow = new BoxRenderable(renderer, {
 root.add(historyWindow);
 
 const historyListBox = new BoxRenderable(renderer, {
-  width: 44,
+  width: historySplit,
   border: true,
   borderStyle: "single",
   title: " HISTORY ",
@@ -895,6 +912,11 @@ const historyListBox = new BoxRenderable(renderer, {
   flexDirection: "column",
 });
 historyWindow.add(historyListBox);
+
+const historyDivider = new BoxRenderable(renderer, {
+  width: 1, flexShrink: 0, backgroundColor: C.bg, selectable: false,
+} as any);
+historyWindow.add(historyDivider);
 
 const historyList = new BoxRenderable(renderer, {
   flexGrow: 1,
@@ -916,6 +938,7 @@ historyWindow.add(historyDetailBox);
 const historyDetail = new TextareaRenderable(renderer, {
   backgroundColor: C.bg,
   textColor: C.fg,
+  width: "100%", height: "100%",
   selectable: true,
 });
 historyDetailBox.add(historyDetail);
@@ -929,7 +952,7 @@ const envWindow = new BoxRenderable(renderer, {
 root.add(envWindow);
 
 const envListBox = new BoxRenderable(renderer, {
-  width: 32,
+  width: environmentSplit,
   border: true,
   borderStyle: "single",
   title: " ENVIRONMENTS ",
@@ -938,6 +961,11 @@ const envListBox = new BoxRenderable(renderer, {
   flexDirection: "column",
 });
 envWindow.add(envListBox);
+
+const environmentDivider = new BoxRenderable(renderer, {
+  width: 1, flexShrink: 0, backgroundColor: C.bg, selectable: false,
+} as any);
+envWindow.add(environmentDivider);
 
 const envList = new BoxRenderable(renderer, {
   flexGrow: 1,
@@ -959,6 +987,7 @@ envWindow.add(envDetailBox);
 const envDetail = new TextareaRenderable(renderer, {
   backgroundColor: C.bg,
   textColor: C.fg,
+  width: "100%", height: "100%",
   selectable: true,
 });
 envDetailBox.add(envDetail);
@@ -979,7 +1008,7 @@ const helpOverlay = new BoxRenderable(renderer, {
 });
 root.add(helpOverlay);
 
-const helpText = new TextareaRenderable(renderer, { backgroundColor: C.bg, textColor: C.fg, selectable: false, flexGrow: 1 });
+const helpText = new TextareaRenderable(renderer, { backgroundColor: "transparent", textColor: C.fg, selectable: false, flexGrow: 1 });
 helpText.onKeyDown = (key) => key.preventDefault();
 helpText.onPaste = (event) => event.preventDefault();
 helpOverlay.add(helpText);
@@ -991,6 +1020,63 @@ historyListBox.onMouseDown = () => { if (appWindow === "history" && historyPane 
 historyDetailBox.onMouseDown = () => { if (appWindow === "history" && historyPane !== "detail") setHistoryPane("detail"); };
 envListBox.onMouseDown = () => { if (appWindow === "environments" && envPane !== "list") setEnvPane("list"); };
 envDetailBox.onMouseDown = () => { if (appWindow === "environments" && envPane !== "editor") setEnvPane("editor"); };
+
+function setSplits(sidebar: number, editor: number) {
+  sidebarSplit = Math.max(15, Math.min(60, sidebar));
+  editorSplit = Math.max(20, Math.min(80, editor));
+  const mainWidth = Math.max(1, main.width - verticalDivider.width);
+  const contentHeight = Math.max(1, rightCol.height - horizontalDivider.height);
+  listBox.width = Math.round(mainWidth * sidebarSplit / 100);
+  editorBox.height = Math.round(contentHeight * editorSplit / 100);
+  renderer.requestRender();
+}
+
+function setFixedSidebarSplit(value: number, container: BoxRenderable, sidebar: BoxRenderable) {
+  const max = Math.max(20, container.width - 20);
+  const width = Math.max(20, Math.min(max, value));
+  sidebar.width = width;
+  if (sidebar === historyListBox) historySplit = width;
+  else if (sidebar === envListBox) environmentSplit = width;
+  renderer.requestRender();
+}
+
+const showDivider = (divider: BoxRenderable) => { divider.backgroundColor = C.dim; };
+const hideDivider = (divider: BoxRenderable) => { divider.backgroundColor = C.bg; };
+
+function setupVerticalDivider(divider: BoxRenderable, container: BoxRenderable, resize: (width: number) => void) {
+  divider.onMouseOver = () => showDivider(divider);
+  divider.onMouseOut = () => hideDivider(divider);
+  divider.onMouseDrag = (event) => {
+    if (event.button !== 0) return;
+    showDivider(divider);
+    resize(event.x - container.screenX);
+    event.preventDefault();
+  };
+  divider.onMouseDragEnd = () => hideDivider(divider);
+}
+
+setupVerticalDivider(verticalDivider, main, (width) => {
+  const available = Math.max(1, main.width - verticalDivider.width);
+  setSplits((width / available) * 100, editorSplit);
+});
+
+horizontalDivider.onMouseOver = () => showDivider(horizontalDivider);
+horizontalDivider.onMouseOut = () => hideDivider(horizontalDivider);
+horizontalDivider.onMouseDrag = (event) => {
+  if (event.button !== 0) return;
+  showDivider(horizontalDivider);
+  const height = Math.max(1, rightCol.height - horizontalDivider.height);
+  setSplits(sidebarSplit, ((event.y - rightCol.screenY) / height) * 100);
+  event.preventDefault();
+};
+horizontalDivider.onMouseDragEnd = () => hideDivider(horizontalDivider);
+
+setupVerticalDivider(historyDivider, historyWindow, (width) => {
+  setFixedSidebarSplit(width, historyWindow, historyListBox);
+});
+setupVerticalDivider(environmentDivider, envWindow, (width) => {
+  setFixedSidebarSplit(width, envWindow, envListBox);
+});
 
 function currentReq(): Req | null {
   const row = treeRows[selectedRow];
@@ -1482,6 +1568,16 @@ function clearVisual() {
   visualTarget = null;
 }
 
+function yankNativeSelection(target: TextareaRenderable): boolean {
+  const selection = renderer.getSelection();
+  const text = target.hasSelection() ? target.getSelectedText() : selection?.getSelectedText();
+  if (!text) return false;
+  register = text;
+  target.clearSelection();
+  statusMsg = `yanked selection (${copyToClipboard(renderer, text)})`;
+  return true;
+}
+
 function scrollText(target: TextareaRenderable, delta: number) {
   const viewport = target.editorView.getViewport();
   target.editorView.setViewport(
@@ -1780,6 +1876,11 @@ function vimNormal(k: string, key: KeyEvent, target: TextareaRenderable = editor
     return;
   }
 
+  if (!pending && k === "y" && !key.shift && yankNativeSelection(target)) {
+    setStatus();
+    return;
+  }
+
   if (pending) {
     const p = pending;
     pending = null;
@@ -1878,6 +1979,7 @@ const PANE_HELP: Record<string, [string, string][]> = {
     ["ctrl-n", "new request"],
     ["ctrl-x", "delete request"],
     ["ctrl-p", "cycle environment"],
+    ["alt+hjkl / alt-0", "resize panes / reset"],
     ["q", "quit"],
   ],
   editor: [
@@ -1885,6 +1987,7 @@ const PANE_HELP: Record<string, [string, string][]> = {
     ...VIM_EDIT,
     ["ctrl-s", "save"],
     ["ctrl-l / ctrl-h", "next pane (response) / prev pane (list)"],
+    ["alt+hjkl / alt-0", "resize panes / reset"],
     ["esc", "leave insert / cancel visual / back to list"],
   ],
   response: [
@@ -1893,6 +1996,7 @@ const PANE_HELP: Record<string, [string, string][]> = {
     ["yy / Y", "yank line / yank all"],
     ["c", "copy mouse selection"],
     ["s", "save body to file"],
+    ["alt+hjkl / alt-0", "resize panes / reset"],
     ["ctrl-p", "cycle environment"],
     ["ctrl-h", "back to request pane"],
     ["esc", "cancel visual"],
@@ -1903,6 +2007,7 @@ const PANE_HELP: Record<string, [string, string][]> = {
     ["ctrl-d / ctrl-u", "jump 5 up / down"],
     ["enter / ctrl-l", "open details"],
     ["y", "copy all"],
+    ["alt+hl / alt-0", "resize sidebar / reset"],
     ["esc", "back to workspace"],
     ["q", "quit"],
   ],
@@ -1910,6 +2015,7 @@ const PANE_HELP: Record<string, [string, string][]> = {
     ...VIM_MOVE,
     ["v / V", "visual char / line"],
     ["y", "yank selection"],
+    ["alt+hl / alt-0", "resize sidebar / reset"],
     ["yy / Y", "yank line / yank all"],
     ["ctrl-h / esc", "back to list"],
   ],
@@ -1918,6 +2024,7 @@ const PANE_HELP: Record<string, [string, string][]> = {
     ["enter", "activate environment"],
     ["e / i / ctrl-l", "open file for editing"],
     ["ctrl-r", "reveal/mask secrets"],
+    ["alt+hl / alt-0", "resize sidebar / reset"],
     ["esc / 1", "back to workspace"],
     ["q", "quit"],
   ],
@@ -1925,6 +2032,7 @@ const PANE_HELP: Record<string, [string, string][]> = {
     ...VIM_MOVE,
     ...VIM_EDIT,
     ["ctrl-s", "save"],
+    ["alt+hl / alt-0", "resize sidebar / reset"],
     ["ctrl-h", "back to list"],
     ["esc", "leave insert / cancel visual / back to list"],
   ],
@@ -1945,7 +2053,11 @@ function helpContext(): keyof typeof PANE_HELP {
 }
 
 let helpVisible = false;
-function hideHelp() { helpVisible = false; helpBackdrop.visible = false; helpOverlay.visible = false; }
+function hideHelp() {
+  helpVisible = false;
+  helpBackdrop.visible = false;
+  helpOverlay.visible = false;
+}
 function showHelp() {
   helpVisible = true;
   helpText.setText(formatHelp(helpContext()));
@@ -1962,6 +2074,33 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
     if (k === "1") { setWindow("workspace"); key.preventDefault(); return; }
     if (k === "2") { setWindow("history"); key.preventDefault(); return; }
     if (k === "3") { setWindow("environments"); key.preventDefault(); return; }
+  }
+
+  if ((appWindow === "workspace" || appWindow === "history" || appWindow === "environments") && (key.meta || key.option) && !insert && !envInsert && !visual && !pending && !filterInputFocused()) {
+    if (appWindow === "workspace") {
+      if (k === "h") setSplits(sidebarSplit - 3, editorSplit);
+      else if (k === "l") setSplits(sidebarSplit + 3, editorSplit);
+      else if (k === "k") setSplits(sidebarSplit, editorSplit - 3);
+      else if (k === "j") setSplits(sidebarSplit, editorSplit + 3);
+      else if (k === "0") setSplits(33, 55);
+      else return;
+      statusMsg = `splits: ${sidebarSplit}% sidebar, ${editorSplit}% editor`;
+    } else if (appWindow === "history") {
+      if (k === "h") setFixedSidebarSplit(historySplit - 3, historyWindow, historyListBox);
+      else if (k === "l") setFixedSidebarSplit(historySplit + 3, historyWindow, historyListBox);
+      else if (k === "0") setFixedSidebarSplit(44, historyWindow, historyListBox);
+      else return;
+      statusMsg = `history sidebar: ${historySplit} columns`;
+    } else {
+      if (k === "h") setFixedSidebarSplit(environmentSplit - 3, envWindow, envListBox);
+      else if (k === "l") setFixedSidebarSplit(environmentSplit + 3, envWindow, envListBox);
+      else if (k === "0") setFixedSidebarSplit(32, envWindow, envListBox);
+      else return;
+      statusMsg = `environment sidebar: ${environmentSplit} columns`;
+    }
+    setStatus();
+    key.preventDefault();
+    return;
   }
 
   if (appWindow === "environments") {
