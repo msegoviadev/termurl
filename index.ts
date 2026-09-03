@@ -1,6 +1,7 @@
 import {
   createCliRenderer,
   BoxRenderable,
+  ScrollBoxRenderable,
   TextRenderable,
   TextareaRenderable,
   InputRenderable,
@@ -846,10 +847,11 @@ main.add(verticalDivider);
 const filterInput = new InputRenderable(renderer, { placeholder: "/ filter", backgroundColor: "transparent", textColor: C.fg });
 listBox.add(filterInput);
 
-const treeList = new BoxRenderable(renderer, {
+const treeList = new ScrollBoxRenderable(renderer, {
   flexGrow: 1,
-  flexDirection: "column",
   backgroundColor: C.bg,
+  scrollY: true,
+  viewportCulling: true,
 });
 listBox.add(treeList);
 
@@ -1464,6 +1466,13 @@ function flattenTree(node: TreeNode, parentPath = "", depth = 0): TreeRow[] {
   return rows;
 }
 
+function ensureSelectedRowVisible() {
+  const height = treeList.viewport.height;
+  if (height <= 0) return;
+  if (selectedRow < treeList.scrollTop) treeList.scrollTop = selectedRow;
+  else if (selectedRow >= treeList.scrollTop + height) treeList.scrollTop = selectedRow - height + 1;
+}
+
 function renderTree() {
   for (const child of treeList.getChildren()) {
     treeList.remove(child);
@@ -1505,6 +1514,7 @@ function renderTree() {
     };
     treeList.add(rowRenderable);
   });
+  ensureSelectedRowVisible();
 }
 
 function refreshList(keepName?: string, touchEditor = true) {
@@ -1971,6 +1981,7 @@ const PANE_HELP: Record<string, [string, string][]> = {
     ["ctrl-d / ctrl-u", "page down / up"],
     ["/", "filter"],
     ["enter", "run request / toggle folder"],
+    ["l", "toggle folder / open request pane"],
     ["ctrl-enter / ctrl-f", "run flow"],
     ["tab", "queue/unqueue for flow"],
     ["e / i / ctrl-l", "open request pane"],
@@ -2216,6 +2227,16 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
     if (key.ctrl && k === "u") { moveSelection(-5); key.preventDefault(); return; }
     if (k === "j") { moveSelection(1); key.preventDefault(); return; }
     if (k === "k") { moveSelection(-1); key.preventDefault(); return; }
+    if (k === "l") {
+      const row = treeRows[selectedRow];
+      if (row?.type === "folder") {
+        collapsed.has(row.path) ? collapsed.delete(row.path) : collapsed.add(row.path);
+        refreshList();
+      } else if (row) {
+        setPane("editor");
+      }
+      key.preventDefault(); return;
+    }
     if (k === "g" && !key.shift) { listPending = "g"; setStatus(); key.preventDefault(); return; }
     if (k === "G" || (k === "g" && key.shift)) { selectedRow = Math.max(0, treeRows.length - 1); renderTree(); key.preventDefault(); return; }
     if ((k === "enter" || k === "return") && key.ctrl) { runFlow(); key.preventDefault(); return; }
