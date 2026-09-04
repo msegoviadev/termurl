@@ -17,8 +17,9 @@ newer, must be on `PATH`.
 ## Discover
 
 - `termurl list --json` lists request names, files, methods, paths, descriptions,
-  and variables.
-- `termurl show <request>` prints the raw hurl file.
+  variables, and variants.
+- `termurl show <request>` prints the raw hurl file. Append `@variant` to print
+  only that entry, e.g. `termurl show specs/get@bad-payload`.
 - `termurl env list --json` lists available environments.
 - `termurl env show <name>` displays environment variables. Shared `.env`
   secrets are masked unless `--reveal` is explicitly used.
@@ -50,6 +51,14 @@ requests are available to later requests:
 
 ```bash
 termurl run auth/login users/me --env dev
+```
+
+Requests can define variants (alternative headers and body in the same file).
+Run one by appending `@variant` to the name, including inside flows:
+
+```bash
+termurl run anything/post@bad-payload --env dev --json
+termurl run auth/login anything/post@xml --env dev
 ```
 
 Pass ad-hoc variables with repeatable `--var KEY=value`. Captures exist only

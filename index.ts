@@ -84,14 +84,15 @@ usage:
   termurl init [path] [--yes]                  create config and a starter collection
   termurl doctor [--json]                      check hurl, config, and collection setup
   termurl list [--json]                        list requests
-  termurl show <request>                       print a request file
+  termurl show <request[@variant]>             print a request file or a single variant
   termurl env list [--json]                    list environments
   termurl env show <name> [--reveal] [--json]  show environment variables
-  termurl run <request...> [options]            run requests in argument order
+  termurl run <request[@variant]...> [options]  run requests in argument order
   termurl --version                            print the version
 
 run options:
   --env <name>     choose an environment
+  --variant <name> run a variant for all requests without an explicit @variant
   --var KEY=value  add a variable, repeatable
   --json           print structured results to stdout
   -q, --quiet      suppress the run report on stderr
@@ -121,7 +122,7 @@ if (args[0] === "version" || hasFlag("--version")) {
 }
 
 const isDoctor = args[0] === "doctor";
-if (!HEADLESS_COMMANDS.has(args[0] ?? "") && (args.includes("--env") || args.some((arg) => arg.startsWith("--env=")) || args.includes("--json") || args.includes("--var") || args.some((arg) => arg.startsWith("--var=")))) {
+if (!HEADLESS_COMMANDS.has(args[0] ?? "") && (args.includes("--env") || args.some((arg) => arg.startsWith("--env=")) || args.includes("--json") || args.includes("--var") || args.some((arg) => arg.startsWith("--var=")) || args.includes("--variant") || args.some((arg) => arg.startsWith("--variant=")))) {
   console.error(`termurl: did you mean \`termurl run ${args.join(" ")}\`?`);
   process.exit(1);
 }
@@ -145,6 +146,9 @@ if (!isDoctor && (!existsSync(COLLECTION) || !statSync(COLLECTION).isDirectory()
 }
 const HISTORY_FILE = join(COLLECTION, ".termurl/history.jsonl");
 
+const REQUEST_LINE = /^(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS) \S+/;
+const VARIANT_MARKER = /^#\s*variant:\s*(.+?)\s*$/;
+
 const requests = loadRequests();
 const environments = environmentNames();
 if (environments.length === 0) environments.push("dev");
@@ -162,7 +166,7 @@ const C = {
   cyan: "#7dcfff",
 };
 
-type Req = { name: string; file: string; desc: string; method: string; path: string; vars: string[] };
+type Req = { name: string; file: string; desc: string; method: string; path: string; vars: string[]; variants: string[] };
 
 function walk(dir: string): string[] {
   let entries: string[];
@@ -187,7 +191,8 @@ function loadRequests(collection = COLLECTION): Req[] {
       const method = reqLine?.[1] ?? "?";
       const path = (reqLine?.[2] ?? "").replace("{{host}}", "");
       const vars = [...new Set([...src.matchAll(/\{\{([a-z_]+)\}\}/g)].map((m) => m[1]).filter((v) => v !== "host"))];
-      return { name, file, desc, method, path, vars };
+      const variants = parseEntries(src).slice(1).map((entry) => entry.name).filter((name): name is string => Boolean(name));
+      return { name, file, desc, method, path, vars, variants };
     })
     .sort((a, b) => a.name.localeCompare(b.name));
 }
@@ -195,6 +200,62 @@ function loadRequests(collection = COLLECTION): Req[] {
 function section(src: string, name: string): string[] {
   const m = src.match(new RegExp(`^\\[${name}\\]\\n((?:[^\\[].*\\n?)*)`, "m"));
   return m ? m[1].trim().split("\n").filter(Boolean) : [];
+}
+
+// A .hurl file may hold several entries (hurl runs them top to bottom). The first
+// entry is the default request; every later entry is a named variant, marked by a
+// `# variant: <name>` comment directly above its request line. Extra entries
+// without a marker get an auto name so they never silently disappear.
+type Entry = { name?: string; start: number; end: number; text: string };
+
+function parseEntries(src: string): Entry[] {
+  const lines = src.split("\n");
+  const lineOffsets: number[] = [];
+  let offset = 0;
+  for (const line of lines) {
+    lineOffsets.push(offset);
+    offset += line.length + 1;
+  }
+  const requestLines: number[] = [];
+  lines.forEach((line, index) => { if (REQUEST_LINE.test(line)) requestLines.push(index); });
+  if (requestLines.length === 0) return [{ start: 0, end: src.length, text: src }];
+
+  const entryStartLine = (index: number): number => {
+    if (index === 0) return 0;
+    let start = requestLines[index];
+    while (start > 0 && lines[start - 1].trimStart().startsWith("#")) start--;
+    return start;
+  };
+
+  return requestLines.map((requestLine, index) => {
+    const startLine = entryStartLine(index);
+    const endLine = index + 1 < requestLines.length ? entryStartLine(index + 1) : lines.length;
+    const start = lineOffsets[startLine];
+    const end = endLine >= lines.length ? src.length : lineOffsets[endLine];
+    let name: string | undefined;
+    if (index > 0) {
+      for (let line = requestLine - 1; line >= startLine; line--) {
+        const marker = lines[line].match(VARIANT_MARKER);
+        if (marker) { name = marker[1]; break; }
+      }
+      name ??= `entry-${index + 1}`;
+    }
+    return { name, start, end, text: src.slice(start, end).replace(/\n+$/, "") };
+  });
+}
+
+function entrySource(req: Req, variant?: string): string {
+  let src = "";
+  try { src = readFileSync(req.file, "utf8"); } catch { return ""; }
+  const entries = parseEntries(src);
+  if (!variant) return entries[0]?.text ?? src;
+  return entries.find((entry) => entry.name === variant)?.text ?? entries[0]?.text ?? src;
+}
+
+type RunTarget = { req: Req; variant?: string };
+
+function targetKey(req: Req, variant?: string): string {
+  return variant ? `${req.name}@${variant}` : req.name;
 }
 
 type RunResult = {
@@ -408,12 +469,12 @@ function formatBody(body: string): string {
   return `${lines.slice(0, BODY_DISPLAY_LINES).join("\n")}\n… truncated, showing ${BODY_DISPLAY_LINES} of ${lines.length} lines · press s to save the full body to a file`;
 }
 
-async function runHurl(requestsToRun: Req[]): Promise<RunResult[]> {
+async function runHurl(targets: RunTarget[]): Promise<RunResult[]> {
   const tempDir = mkdtempSync(join(tmpdir(), "termurl-run-"));
   const hurlFile = join(tempDir, "run.hurl");
-  const outputFiles = requestsToRun.map((_, index) => `response-${index + 1}.body`);
-  const source = requestsToRun
-    .map((req, index) => addResponseOutput(readFileSync(req.file, "utf8"), outputFiles[index]))
+  const outputFiles = targets.map((_, index) => `response-${index + 1}.body`);
+  const source = targets
+    .map((target, index) => addResponseOutput(entrySource(target.req, target.variant), outputFiles[index]))
     .join("\n\n");
   writeFileSync(hurlFile, source);
 
@@ -434,7 +495,7 @@ async function runHurl(requestsToRun: Req[]): Promise<RunResult[]> {
     try { report = JSON.parse(stdout) as HurlJson; } catch {}
     const processError = stderr.trim() || `Hurl exited with code ${exitCode}`;
 
-    return requestsToRun.map((req, index) => {
+    return targets.map((target, index) => {
       const entry = report?.entries?.[index];
       const call = entry?.calls?.[entry.calls.length - 1];
       const asserts = entry?.asserts ?? [];
@@ -456,7 +517,7 @@ async function runHurl(requestsToRun: Req[]): Promise<RunResult[]> {
         status,
         ms: Math.round(duration),
         asserts: { passed: asserts.filter((assert) => assert.success).length, total: asserts.length },
-        captures: captureNames(req),
+        captures: captureNames(target.req, target.variant),
         captured,
         headers: call?.response?.headers?.map((header) => `${header.name}: ${header.value}`) ?? [],
         body,
@@ -472,7 +533,7 @@ async function runHurl(requestsToRun: Req[]): Promise<RunResult[]> {
       };
     });
   } catch (error) {
-    return requestsToRun.map(() => emptyRunResult(error instanceof Error ? error.message : String(error)));
+    return targets.map(() => emptyRunResult(error instanceof Error ? error.message : String(error)));
   } finally {
     rmSync(tempDir, { recursive: true, force: true });
   }
@@ -482,11 +543,11 @@ function positionalArgs(values: string[]): string[] {
   const positional: string[] = [];
   for (let index = 0; index < values.length; index += 1) {
     const value = values[index];
-    if (value === "--env" || value === "--var") {
+    if (value === "--env" || value === "--var" || value === "--variant") {
       index += 1;
       continue;
     }
-    if (value.startsWith("--env=") || value.startsWith("--var=") || value === "--json" || value === "--reveal" || value === "--quiet" || value === "-q") continue;
+    if (value.startsWith("--env=") || value.startsWith("--var=") || value.startsWith("--variant=") || value === "--json" || value === "--reveal" || value === "--quiet" || value === "-q") continue;
     if (!value.startsWith("-")) positional.push(value);
   }
   return positional;
@@ -521,6 +582,18 @@ function requestForInput(input: string): Req | undefined {
   return requests.find((request) => request.name === input || request.name === withoutExtension || request.name === relativeName || request.file === absolute);
 }
 
+function resolveTarget(input: string): { target?: RunTarget; error?: string } {
+  const at = input.lastIndexOf("@");
+  const base = at > 0 ? input.slice(0, at) : input;
+  const variant = at > 0 ? input.slice(at + 1) : undefined;
+  const req = requestForInput(base);
+  if (!req) return {};
+  if (variant !== undefined && !req.variants.includes(variant)) {
+    return { error: `unknown variant "${variant}" for ${req.name}; available variants: ${req.variants.join(", ") || "none"}` };
+  }
+  return { target: { req, variant } };
+}
+
 function unknownRequest(input: string): number {
   console.error(`termurl: unknown request "${input}"`);
   if (requests.length) console.error(`available requests:\n${requests.map((request) => `  ${request.name}`).join("\n")}`);
@@ -535,6 +608,7 @@ function listCommand(json: boolean): number {
     path: request.path,
     description: request.desc,
     variables: request.vars,
+    variants: request.variants,
   }));
   if (json) {
     console.log(JSON.stringify(result, null, 2));
@@ -549,12 +623,20 @@ function listCommand(json: boolean): number {
 
 function showCommand(input: string | undefined): number {
   if (!input) {
-    console.error("termurl: usage: termurl show <request>");
+    console.error("termurl: usage: termurl show <request[@variant]>");
     return 1;
   }
-  const request = requestForInput(input);
-  if (!request) return unknownRequest(input);
-  process.stdout.write(readFileSync(request.file, "utf8"));
+  const resolved = resolveTarget(input);
+  if (resolved.error) {
+    console.error(`termurl: ${resolved.error}`);
+    return 1;
+  }
+  if (!resolved.target) return unknownRequest(input);
+  if (resolved.target.variant) {
+    process.stdout.write(`${entrySource(resolved.target.req, resolved.target.variant)}\n`);
+    return 0;
+  }
+  process.stdout.write(readFileSync(resolved.target.req.file, "utf8"));
   return 0;
 }
 
@@ -632,10 +714,11 @@ function doctorCommand(json: boolean): number {
   return ok ? 0 : 1;
 }
 
-function headlessResult(result: RunResult, request: Req) {
+function headlessResult(result: RunResult, target: RunTarget) {
   return {
-    request: request.name,
-    file: request.file,
+    request: target.req.name,
+    ...(target.variant ? { variant: target.variant } : {}),
+    file: target.req.file,
     success: result.success,
     status: result.status,
     durationMs: result.ms,
@@ -647,11 +730,11 @@ function headlessResult(result: RunResult, request: Req) {
   };
 }
 
-function printRunReport(request: Req, result: RunResult): void {
+function printRunReport(target: RunTarget, result: RunResult): void {
   const status = result.status || "error";
   const asserts = `${result.asserts.passed}/${result.asserts.total}`;
   const captures = Object.keys(result.captured);
-  console.error(`${result.success ? "ok" : "fail"} ${request.name} ${status} ${result.ms}ms asserts ${asserts}${captures.length ? ` captures ${captures.join(",")}` : ""}`);
+  console.error(`${result.success ? "ok" : "fail"} ${targetKey(target.req, target.variant)} ${status} ${result.ms}ms asserts ${asserts}${captures.length ? ` captures ${captures.join(",")}` : ""}`);
   if (result.error) console.error(result.error);
 }
 
@@ -671,17 +754,27 @@ async function runCommand(values: string[]): Promise<number> {
     }
     environmentIdx = index;
   }
+  const variantOption = optionValue(values, "--variant");
   cliVariables = parsed.variables ?? {};
   const inputs = positionalArgs(values);
   if (inputs.length === 0) {
-    console.error("termurl: usage: termurl run <request...> [--env name] [--var KEY=value] [--json] [-q]");
+    console.error("termurl: usage: termurl run <request[@variant]...> [--env name] [--variant name] [--var KEY=value] [--json] [-q]");
     return 1;
   }
-  const targets: Req[] = [];
+  const targets: RunTarget[] = [];
   for (const input of inputs) {
-    const request = requestForInput(input);
-    if (!request) return unknownRequest(input);
-    targets.push(request);
+    const resolved = resolveTarget(input);
+    if (resolved.error) {
+      console.error(`termurl: ${resolved.error}`);
+      return 1;
+    }
+    if (!resolved.target) return unknownRequest(input);
+    const variant = resolved.target.variant ?? variantOption;
+    if (variant && !resolved.target.req.variants.includes(variant)) {
+      console.error(`termurl: unknown variant "${variant}" for ${resolved.target.req.name}; available variants: ${resolved.target.req.variants.join(", ") || "none"}`);
+      return 1;
+    }
+    targets.push({ req: resolved.target.req, variant });
   }
 
   const results = await runHurl(targets);
@@ -696,7 +789,7 @@ async function runCommand(values: string[]): Promise<number> {
   } else {
     results.forEach((result, index) => {
       if (index > 0) process.stdout.write("\n");
-      process.stdout.write(`==> ${targets[index].name}\n`);
+      process.stdout.write(`==> ${targetKey(targets[index].req, targets[index].variant)}\n`);
       if (result.body) process.stdout.write(`${result.body}${result.body.endsWith("\n") ? "" : "\n"}`);
     });
   }
@@ -743,6 +836,8 @@ renderer.setBackgroundColor(C.bg);
 const flowQueue = new Map<string, number>();
 const lastResult = new Map<string, "ok" | "fail">();
 const lastBodies = new Map<string, string>();
+const activeVariant = new Map<string, string>();
+let editorEntry: { reqName: string; variant?: string } | null = null;
 type Pane = "list" | "editor" | "response";
 let pane: Pane = "list";
 let insert = false;
@@ -765,6 +860,7 @@ let appWindow: AppWindow = "workspace";
 type HistoryRecord = {
   ts: string;
   request: string;
+  variant?: string;
   environment?: string;
   profile?: string;
   status: number;
@@ -808,10 +904,12 @@ let lastRowClick = { index: -1, time: 0 };
 let listPending: string | null = null;
 
 function requestLabel(r: Req): string {
-  const order = flowQueue.get(r.name);
+  const variant = currentVariant(r);
+  const order = flowQueue.get(targetKey(r, variant));
   const mark = order === undefined ? "[ ]" : `[${order}]`;
   const name = r.name.split("/").pop() ?? r.name;
-  return `${mark} ${r.method.padEnd(6)} ${name}`;
+  const suffix = variant ? ` @${variant}` : r.variants.length > 0 ? ` +${r.variants.length}` : "";
+  return `${mark} ${r.method.padEnd(6)} ${name}${suffix}`;
 }
 
 const root = new BoxRenderable(renderer, { flexDirection: "column", width: "100%", height: "100%" });
@@ -865,12 +963,17 @@ const editorBox = new BoxRenderable(renderer, {
 rightCol.add(editorBox);
 
 const editor = new TextareaRenderable(renderer, {
-  initialValue: requests[0] ? readFileSync(requests[0].file, "utf8") : "",
+  initialValue: requests[0] ? entrySource(requests[0]) : "",
   backgroundColor: C.bg, textColor: C.fg,
   width: "100%", height: "100%",
   selectable: true,
 });
 editorBox.add(editor);
+
+const variantStrip = new BoxRenderable(renderer, {
+  height: 1, flexShrink: 0, flexDirection: "row", backgroundColor: "#24283b", visible: false,
+} as any);
+rightCol.add(variantStrip);
 
 const horizontalDivider = new BoxRenderable(renderer, {
   height: 1, flexShrink: 0, backgroundColor: C.bg, selectable: false,
@@ -1085,6 +1188,80 @@ function currentReq(): Req | null {
   return row?.type === "request" ? row.req : null;
 }
 
+function currentVariant(req: Req): string | undefined {
+  const variant = activeVariant.get(req.name);
+  return variant && req.variants.includes(variant) ? variant : undefined;
+}
+
+function requestTitle(insertMode = false): string {
+  const req = currentReq();
+  const variant = req ? currentVariant(req) : undefined;
+  const base = req && variant
+    ? `REQUEST (${req.name}@${variant})`
+    : req && req.variants.length > 0
+      ? `REQUEST (${req.name} +${req.variants.length})`
+      : "REQUEST";
+  return insertMode ? ` ${base} (INSERT) ` : ` ${base} `;
+}
+
+function loadEditorEntry(req: Req) {
+  const variant = currentVariant(req);
+  editorEntry = { reqName: req.name, variant };
+  editor.setText(entrySource(req, variant));
+  editorBox.title = requestTitle(insert);
+  renderVariantStrip(req);
+  refreshEditorHighlights();
+}
+
+function variantOptions(req: Req): (string | undefined)[] {
+  return [undefined, ...req.variants];
+}
+
+function setVariant(req: Req, name: string | undefined) {
+  if (name) activeVariant.set(req.name, name);
+  else activeVariant.delete(req.name);
+  loadEditorEntry(req);
+  renderTree();
+  setStatus();
+}
+
+function cycleVariant(delta: number) {
+  const req = currentReq();
+  if (!req || req.variants.length === 0 || insert) return;
+  const options = variantOptions(req);
+  const index = options.indexOf(currentVariant(req));
+  setVariant(req, options[(index + delta + options.length) % options.length]);
+}
+
+function renderVariantStrip(req: Req | null) {
+  for (const child of variantStrip.getChildren()) {
+    variantStrip.remove(child);
+    child.destroy();
+  }
+  const show = Boolean(req && req.variants.length > 0);
+  variantStrip.visible = show;
+  if (!req || !show) return;
+  const active = currentVariant(req);
+  variantStrip.add(new TextRenderable(renderer, {
+    content: " variants: ", height: 1, fg: C.dim, bg: "#24283b", selectable: false,
+  }));
+  for (const name of variantOptions(req)) {
+    const isActive = name === undefined ? active === undefined : name === active;
+    const segment = new TextRenderable(renderer, {
+      content: ` ${name ?? "default"} `,
+      height: 1,
+      fg: isActive ? C.fg : C.dim,
+      bg: isActive ? "#3b4261" : "#24283b",
+      selectable: false,
+    });
+    segment.onMouseDown = () => { if (!insert) setVariant(req, name); };
+    variantStrip.add(segment);
+    variantStrip.add(new TextRenderable(renderer, {
+      content: " ", height: 1, fg: C.dim, bg: "#24283b", selectable: false,
+    }));
+  }
+}
+
 type VariableSource = "file" | "secret" | "capture" | "unresolved";
 
 const variableSyntax = SyntaxStyle.fromStyles({
@@ -1161,8 +1338,8 @@ function renderResponse(text: string, failed: boolean) {
   applyResponseHighlights(respView, text, failed);
 }
 
-function captureNames(req: Req): string[] {
-  return section(readFileSync(req.file, "utf8"), "Captures")
+function captureNames(req: Req, variant?: string): string[] {
+  return section(entrySource(req, variant), "Captures")
     .map((line) => line.match(/^([a-zA-Z_][\w-]*)\s*:/)?.[1])
     .filter((name): name is string => name !== undefined);
 }
@@ -1170,12 +1347,12 @@ function captureNames(req: Req): string[] {
 function availableCaptures(req: Req | null): Set<string> {
   const available = new Set<string>();
   if (!req) return available;
-  const currentOrder = flowQueue.get(req.name);
+  const currentOrder = flowQueue.get(targetKey(req, currentVariant(req)));
   if (currentOrder === undefined) return available;
-  for (const [name, order] of flowQueue) {
+  for (const [key, order] of flowQueue) {
     if (order >= currentOrder) continue;
-    const previous = requests.find((candidate) => candidate.name === name);
-    if (previous) captureNames(previous).forEach((capture) => available.add(capture));
+    const target = resolveKey(key);
+    if (target) captureNames(target.req, target.variant).forEach((capture) => available.add(capture));
   }
   return available;
 }
@@ -1315,8 +1492,13 @@ function historyTime(ts: string): string {
 
 function historyTitle(group: HistoryGroup): string {
   if (group.flow) return `${historyTime(group.ts)}  FLOW  ${group.steps.length} steps  ${historyStatus(group)}`;
-  const request = group.steps[0]?.request ?? "unknown";
+  const step = group.steps[0];
+  const request = step ? targetKeyLabel(step) : "unknown";
   return `${historyTime(group.ts)}  ${request}  ${historyStatus(group)}`;
+}
+
+function targetKeyLabel(step: HistoryRecord): string {
+  return step.variant ? `${step.request}@${step.variant}` : step.request;
 }
 
 function historyDetailText(group: HistoryGroup | undefined): string {
@@ -1329,7 +1511,7 @@ function historyDetailText(group: HistoryGroup | undefined): string {
     "",
   ];
   for (const [index, step] of group.steps.entries()) {
-    lines.push(`${index + 1}. ${step.request} · ${step.status} · ${step.duration_ms}ms`);
+    lines.push(`${index + 1}. ${targetKeyLabel(step)} · ${step.status} · ${step.duration_ms}ms`);
     if (step.error && !step.response?.includes("reason:")) lines.push("reason:", step.error);
     if (step.captures?.length) lines.push(`   captures: ${step.captures.join(", ")}`);
     if (step.request_detail) lines.push("", "request:", step.request_detail);
@@ -1404,18 +1586,19 @@ function loadHistory() {
   if (appWindow === "history") renderHistory();
 }
 
-function recordHistory(req: Req, result: RunResult, flowId?: string, step?: number, flowSize?: number) {
+function recordHistory(target: RunTarget, result: RunResult, flowId?: string, step?: number, flowSize?: number) {
   mkdirSync(join(COLLECTION, ".termurl"), { recursive: true });
   const record: HistoryRecord = {
     ts: new Date().toISOString(),
-    request: req.name,
+    request: target.req.name,
+    ...(target.variant ? { variant: target.variant } : {}),
     environment: environments[environmentIdx],
     status: result.status,
     success: result.success,
     duration_ms: result.ms,
     captures: result.captures,
     ...(formatRequest(result) ? { request_detail: redactResponse(formatRequest(result)!) } : {}),
-    response: redactResponse(formatRun(req, result)),
+    response: redactResponse(formatRun(target.req, result, target.variant)),
     ...(result.error ? { error: result.error } : {}),
     ...(flowId ? { flow_id: flowId, step, flow_size: flowSize } : {}),
   };
@@ -1423,15 +1606,26 @@ function recordHistory(req: Req, result: RunResult, flowId?: string, step?: numb
   loadHistory();
 }
 
+function resolveKey(key: string): RunTarget | undefined {
+  const at = key.lastIndexOf("@");
+  const name = at > 0 ? key.slice(0, at) : key;
+  const variant = at > 0 ? key.slice(at + 1) : undefined;
+  const req = requests.find((r) => r.name === name);
+  if (!req) return undefined;
+  if (variant && !req.variants.includes(variant)) return undefined;
+  return { req, variant };
+}
+
 function normalizeFlowQueue() {
-  const names = [...flowQueue.keys()].filter((name) => requests.some((r) => r.name === name));
+  const keys = [...flowQueue.keys()].filter((key) => resolveKey(key) !== undefined);
   flowQueue.clear();
-  names.forEach((name, index) => flowQueue.set(name, index + 1));
+  keys.forEach((key, index) => flowQueue.set(key, index + 1));
 }
 
 function toggleFlowRequest(req: Req) {
-  if (flowQueue.has(req.name)) flowQueue.delete(req.name);
-  else flowQueue.set(req.name, flowQueue.size + 1);
+  const key = targetKey(req, currentVariant(req));
+  if (flowQueue.has(key)) flowQueue.delete(key);
+  else flowQueue.set(key, flowQueue.size + 1);
   normalizeFlowQueue();
 }
 
@@ -1529,10 +1723,7 @@ function refreshList(keepName?: string, touchEditor = true) {
   }
   selectedRow = Math.max(0, Math.min(selectedRow, Math.max(0, treeRows.length - 1)));
   const req = currentReq();
-  if (req && touchEditor) {
-    editor.setText(readFileSync(req.file, "utf8"));
-    refreshEditorHighlights();
-  }
+  if (req && touchEditor) loadEditorEntry(req);
   renderTree();
 }
 
@@ -1553,10 +1744,7 @@ function moveSelection(delta: number) {
   if (treeRows.length === 0) return;
   selectedRow = Math.max(0, Math.min(treeRows.length - 1, selectedRow + delta));
   const req = currentReq();
-  if (req) {
-    editor.setText(readFileSync(req.file, "utf8"));
-    refreshEditorHighlights();
-  }
+  if (req) loadEditorEntry(req);
   renderTree();
 }
 
@@ -1635,7 +1823,7 @@ function setPane(p: Pane) {
   editorBox.borderColor = p === "editor" ? C.yellow : C.dim;
   responseBox.borderColor = p === "response" ? C.yellow : C.dim;
   listBox.title = " REQUESTS ";
-  editorBox.title = " REQUEST ";
+  editorBox.title = requestTitle();
   responseBox.title = " RESPONSE ";
   if (p === "editor") editor.focus();
   else editor.blur();
@@ -1712,10 +1900,10 @@ function formatRequest(r: RunResult): string | undefined {
     (r.request.body ? `\n  body:\n${indent(indent(formatBody(r.request.body)))}` : "");
 }
 
-function formatRun(req: Req, r: RunResult): string {
+function formatRun(req: Req, r: RunResult, variant?: string): string {
   const ok = r.success;
   const request = formatRequest(r);
-  return `${ok ? "✓" : "✗"} ${r.status} ${ok ? "OK" : "FAILED"} · ${r.ms}ms · env: ${environments[environmentIdx]}\n\n` +
+  return `${ok ? "✓" : "✗"} ${r.status} ${ok ? "OK" : "FAILED"} · ${r.ms}ms · env: ${environments[environmentIdx]}${variant ? ` · variant: ${variant}` : ""}\n\n` +
     (request ? `${request}\n\n` : "") +
     `RESPONSE\n` +
     (r.headers.length ? `  headers:\n${indent(indent(r.headers.join("\n")))}\n\n` : "") +
@@ -1727,15 +1915,17 @@ function formatRun(req: Req, r: RunResult): string {
 }
 
 async function runRequest(req: Req) {
-  statusMsg = `running ${req.name}`;
+  const variant = currentVariant(req);
+  const key = targetKey(req, variant);
+  statusMsg = `running ${key}`;
   setStatus();
-  const [r] = await runHurl([req]);
-  lastResult.set(req.name, r.success ? "ok" : "fail");
+  const [r] = await runHurl([{ req, variant }]);
+  lastResult.set(key, r.success ? "ok" : "fail");
   lastBodies.clear();
-  if (r.body) lastBodies.set(req.name, r.body);
-  renderResponse(formatRun(req, r), !r.success);
+  if (r.body) lastBodies.set(key, r.body);
+  renderResponse(formatRun(req, r, variant), !r.success);
   refreshEditorHighlights();
-  recordHistory(req, r);
+  recordHistory({ req, variant }, r);
   refreshList(req.name);
   statusMsg = "";
   setStatus();
@@ -1744,8 +1934,8 @@ async function runRequest(req: Req) {
 async function runFlow() {
   const targets = [...flowQueue.entries()]
     .sort(([, a], [, b]) => a - b)
-    .map(([name]) => requests.find((r) => r.name === name))
-    .filter((r): r is Req => r !== undefined);
+    .map(([key]) => resolveKey(key))
+    .filter((target): target is RunTarget => target !== undefined);
   if (targets.length === 0) {
     statusMsg = "mark requests first";
     setStatus();
@@ -1756,13 +1946,14 @@ async function runFlow() {
   const results = await runHurl(targets);
   lastBodies.clear();
   const flowId = `flow-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  const parts = targets.map((req, index) => {
+  const parts = targets.map((target, index) => {
     const r = results[index] ?? emptyRunResult("Hurl did not return a result for this step");
-    lastResult.set(req.name, r.success ? "ok" : "fail");
-    if (r.body) lastBodies.set(req.name, r.body);
-    const response = formatRun(req, r);
-    recordHistory(req, r, flowId, index + 1, targets.length);
-    return `▸ ${index + 1}. ${req.name}\n${response}`;
+    const key = targetKey(target.req, target.variant);
+    lastResult.set(key, r.success ? "ok" : "fail");
+    if (r.body) lastBodies.set(key, r.body);
+    const response = formatRun(target.req, r, target.variant);
+    recordHistory(target, r, flowId, index + 1, targets.length);
+    return `▸ ${index + 1}. ${key}\n${response}`;
   });
   renderResponse(`flow (env: ${environments[environmentIdx]}), ${targets.length} requests\n\n` + parts.join(`\n\n${"─".repeat(60)}\n\n`), results.some((result) => !result.success));
   refreshEditorHighlights();
@@ -1771,7 +1962,7 @@ async function runFlow() {
   setStatus();
 }
 
-function enterInsert(title = " REQUEST (INSERT) ") {
+function enterInsert(title = requestTitle(true)) {
   insert = true;
   pending = null;
   editorBox.title = title;
@@ -1781,7 +1972,7 @@ function enterInsert(title = " REQUEST (INSERT) ") {
 function leaveInsert() {
   insert = false;
   pending = null;
-  editorBox.title = " REQUEST ";
+  editorBox.title = requestTitle();
   setStatus();
 }
 
@@ -1947,9 +2138,21 @@ function vimNormal(k: string, key: KeyEvent, target: TextareaRenderable = editor
 
 function saveEditor() {
   const req = currentReq();
-  if (!req) return;
-  writeFileSync(req.file, editor.plainText);
-  statusMsg = `saved ${req.name}`;
+  if (!req || !editorEntry || editorEntry.reqName !== req.name) return;
+  let src = "";
+  try { src = readFileSync(req.file, "utf8"); } catch { return; }
+  const entries = parseEntries(src);
+  const entry = editorEntry.variant ? entries.find((candidate) => candidate.name === editorEntry!.variant) : entries[0];
+  if (!entry) {
+    statusMsg = `variant "${editorEntry.variant}" no longer exists in ${req.name}`;
+    setStatus();
+    return;
+  }
+  const text = editor.plainText.replace(/\n+$/, "");
+  const tail = src.slice(entry.end);
+  const next = src.slice(0, entry.start) + text + (tail ? "\n\n" : "\n") + tail;
+  writeFileSync(req.file, next);
+  statusMsg = `saved ${targetKey(req, editorEntry.variant)}`;
   setStatus();
   setTimeout(() => { statusMsg = ""; setStatus(); }, 2000);
 }
@@ -1982,8 +2185,10 @@ const PANE_HELP: Record<string, [string, string][]> = {
     ["/", "filter"],
     ["enter", "run request / toggle folder"],
     ["l", "toggle folder / open request pane"],
-    ["ctrl-enter / ctrl-f", "run flow"],
+    ["shift-enter / ctrl-f", "run flow"],
     ["tab", "queue/unqueue for flow"],
+    ["v / ]", "next variant"],
+    ["[", "previous variant"],
     ["e / i / ctrl-l", "open request pane"],
     ["y", "copy as hurl"],
     ["Y", "copy as curl"],
@@ -1996,6 +2201,7 @@ const PANE_HELP: Record<string, [string, string][]> = {
   editor: [
     ...VIM_MOVE,
     ...VIM_EDIT,
+    ["[ / ]", "previous / next variant"],
     ["ctrl-s", "save"],
     ["ctrl-l / ctrl-h", "next pane (response) / prev pane (list)"],
     ["alt+hjkl / alt-0", "resize panes / reset"],
@@ -2192,6 +2398,8 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
     }
     if (visual && k === "escape") { clearVisual(); setStatus(); key.preventDefault(); return; }
     if (k === "escape") { setPane("list"); key.preventDefault(); return; }
+    if (k === "[") { cycleVariant(-1); key.preventDefault(); return; }
+    if (k === "]") { cycleVariant(1); key.preventDefault(); return; }
     vimNormal(k, key);
     key.preventDefault();
     return;
@@ -2239,7 +2447,7 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
     }
     if (k === "g" && !key.shift) { listPending = "g"; setStatus(); key.preventDefault(); return; }
     if (k === "G" || (k === "g" && key.shift)) { selectedRow = Math.max(0, treeRows.length - 1); renderTree(); key.preventDefault(); return; }
-    if ((k === "enter" || k === "return") && key.ctrl) { runFlow(); key.preventDefault(); return; }
+    if ((k === "enter" || k === "return") && key.shift) { runFlow(); key.preventDefault(); return; }
     if (k === "enter" || k === "return") { activateSelection(); key.preventDefault(); return; }
     if (k === "tab") {
       const r = currentReq();
@@ -2249,12 +2457,15 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
     if (k === "f" && key.ctrl) { runFlow(); key.preventDefault(); return; }
     if (k === "e") { setPane("editor"); key.preventDefault(); return; }
     if (k === "i") { setPane("editor"); enterInsert(); key.preventDefault(); return; }
+    if (k === "v") { cycleVariant(1); key.preventDefault(); return; }
+    if (k === "[") { cycleVariant(-1); key.preventDefault(); return; }
+    if (k === "]") { cycleVariant(1); key.preventDefault(); return; }
     if (k === "n" && key.ctrl) {
       const name = `untitled-${Date.now() % 100000}`;
       const file = join(COLLECTION, `${name}.hurl`);
       const template = "# TODO: describe this request\nGET {{host}}/\n";
       writeFileSync(file, template);
-      requests.push({ name, file, desc: "TODO", method: "GET", path: "/", vars: [] });
+      requests.push({ name, file, desc: "TODO", method: "GET", path: "/", vars: [], variants: [] });
       requests.sort((a, b) => a.name.localeCompare(b.name));
       refreshList(name);
       editor.setText(template);
@@ -2266,7 +2477,10 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
       if (r) {
         rmSync(r.file);
         requests.splice(requests.indexOf(r), 1);
-        flowQueue.delete(r.name); normalizeFlowQueue(); lastResult.delete(r.name);
+        for (const key of [...flowQueue.keys()]) if (key === r.name || key.startsWith(`${r.name}@`)) flowQueue.delete(key);
+        normalizeFlowQueue();
+        activeVariant.delete(r.name);
+        for (const key of [...lastResult.keys()]) if (key === r.name || key.startsWith(`${r.name}@`)) lastResult.delete(key);
         refreshList(); statusMsg = `deleted ${r.name}`; setStatus();
       }
       key.preventDefault(); return;
@@ -2274,7 +2488,7 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
     if (k === "y" && !key.shift) {
       const r = currentReq();
       if (r) {
-        const rendered = renderTemplate(readFileSync(r.file, "utf8")).replace(/\n?$/, "\n");
+        const rendered = renderTemplate(entrySource(r, currentVariant(r))).replace(/\n?$/, "\n");
         const cmd = `hurl <<'HURL_EOF'\n${rendered}HURL_EOF`;
         statusMsg = `copied hurl command (${copyToClipboard(renderer, cmd)})`;
       }
@@ -2282,7 +2496,7 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
     }
     if (k === "Y" || (k === "y" && key.shift)) {
       const r = currentReq();
-      const cmd = r ? renderCurl(renderTemplate(readFileSync(r.file, "utf8"))) : undefined;
+      const cmd = r ? renderCurl(renderTemplate(entrySource(r, currentVariant(r)))) : undefined;
       statusMsg = cmd ? `copied curl (${copyToClipboard(renderer, cmd)})` : "couldn't build a curl command for this request";
       setStatus(); key.preventDefault(); return;
     }

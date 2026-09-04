@@ -70,7 +70,7 @@ exist.
 1. Browse requests in the workspace window.
 2. Press `enter` to run the selected request.
 3. Press `tab` to queue or unqueue requests.
-4. Press `ctrl-enter` or `ctrl-f` to run the queued requests in order as one
+4. Press `shift-enter` or `ctrl-f` to run the queued requests in order as one
    Hurl flow.
 5. Use `ctrl-l` and `ctrl-h` to move between the request, editor, and response
    panes.
@@ -87,6 +87,7 @@ Useful controls:
   them in any other terminal.
 - `s`: save the complete response body to `.termurl/bodies/`.
 - `i`: enter INSERT mode in an editor; `ctrl-s`: save the file.
+- `v` / `]`: next variant; `[`: previous variant (when the request has any).
 - `ctrl-p`: cycle environments.
 - `?`: show shortcuts for the current pane; `q`: quit.
 
@@ -187,6 +188,12 @@ later requests in the same invocation:
 termurl run auth/login users/me --env dev --json
 ```
 
+Run a single variant of a request (see [Variants](#variants)):
+
+```bash
+termurl run specs/get@bad-payload --env dev --json
+```
+
 Pass additional variables with repeatable `--var` options:
 
 ```bash
@@ -234,6 +241,48 @@ Environments use `.env.<name>` files. Shared secrets use a plain `.env`, which
 is not an environment. Variables are parsed as simple `KEY=value` lines.
 Variable precedence is captures, then shared `.env` values, then the selected
 environment file.
+
+### Variants
+
+One request can offer several header and body combinations without duplicating
+the file. Add extra entries to the same `.hurl` file, each marked by a
+`# variant: <name>` comment directly above its request line:
+
+```hurl
+# Anything echo POST
+POST {{host}}/anything/echo
+Content-Type: application/json
+{"probe":"post"}
+HTTP 200
+
+# variant: bad-payload
+POST {{host}}/anything/echo
+Content-Type: application/json
+{"probe":
+HTTP 400
+```
+
+The first entry is the default. Every variant is a complete entry with its own
+headers, body, and assertions, so a variant can expect a different status code.
+The file stays valid Hurl: `hurl file.hurl` runs every entry in order.
+
+In the TUI, requests with variants show a `+N` badge on the row and a variant
+strip under the request pane listing every variant as a tab. Cycle with `v` /
+`]` (next) and `[` (previous), or click a tab. Switching is instant: the
+editor immediately shows that entry, so you see the headers and body as you
+flip through. The active variant shows on the row as `name@variant`, and
+`ctrl-s` writes your edits back into the right spot in the file. Queued flows
+remember the variant you picked.
+
+In the CLI, append `@variant` to the request name or pass `--variant`:
+
+```bash
+termurl run anything/post@bad-payload --env dev
+termurl run auth/login anything/post@xml --env dev   # variants work in flows
+termurl show anything/post@xml                        # print one entry
+```
+
+`termurl list --json` exposes each request's variants.
 
 ## Development
 
