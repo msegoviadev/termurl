@@ -193,6 +193,7 @@ jobs:
           cp /home/builder/aarch64/termurl-*-aarch64.pkg.tar.zst* repo/aarch64/
           (cd repo/x86_64 && repo-add --sign --key "$KEYID" msegoviadev.db.tar.gz termurl-*.pkg.tar.zst)
           (cd repo/aarch64 && repo-add --sign --key "$KEYID" msegoviadev.db.tar.gz termurl-*.pkg.tar.zst)
+          rm -f repo/*/msegoviadev.*.tar.gz.old*
           cd repo
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
