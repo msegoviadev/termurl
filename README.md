@@ -25,16 +25,22 @@ brew tap msegoviadev/tap
 brew install termurl
 ```
 
-On Arch Linux and Omarchy, install the `termurl-bin` AUR package:
+On Arch Linux and Omarchy, install from the `msegoviadev` pacman repository
+(one-time setup, then updates arrive with `pacman -Syu` / `omarchy update`):
 
 ```bash
-yay -S termurl-bin
+curl -fsSL https://msegovia.dev/pacman-repo/msegoviadev.asc | sudo pacman-key --add -
+sudo pacman-key --lsign-key ABD517389B8A1447971AE05F7A1E0EC939A79CBC
 
-# or on Omarchy
-omarchy pkg aur add termurl-bin
+# append to /etc/pacman.conf:
+# [msegoviadev]
+# Server = https://msegovia.dev/pacman-repo/$arch
+
+sudo pacman -Syu termurl
 ```
 
-The AUR package pulls in `hurl` as a dependency.
+Or on Omarchy, after the one-time setup: `omarchy pkg add termurl`.
+The package pulls in `hurl` as a dependency.
 
 Or build from source:
 
@@ -295,4 +301,4 @@ bun run build
 
 The only verification gate is `bun run typecheck`. Release Please creates
 versioned release PRs from Conventional Commits. See [`RELEASING.md`](RELEASING.md)
-for the release and Homebrew automation.
+for the release, Homebrew, and pacman repository automation.

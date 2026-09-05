@@ -15,9 +15,10 @@ truth and is exposed by `termurl --version`.
 7. The binary workflow publishes to both downstream package managers:
    - Generates `homebrew-tap/Formula/termurl.rb` with the exact release
      checksums and pushes it to the tap.
-   - Generates `PKGBUILD` and `.SRCINFO` with the exact release checksums and
-     pushes them to the AUR package
-     [termurl-bin](https://aur.archlinux.org/packages/termurl-bin).
+   - Builds signed `termurl` pacman packages for x86_64 and aarch64 and
+     publishes them to the `msegoviadev` repository hosted at
+     [msegoviadev/pacman-repo](https://github.com/msegoviadev/pacman-repo)
+     (`gh-pages` branch, served at `https://msegovia.dev/pacman-repo/$arch`).
 
 ## Subsequent Releases
 
@@ -33,35 +34,42 @@ Release Please opens a release PR containing the version bump and
 `CHANGELOG.md` update. Merging that PR creates the version tag and GitHub
 Release, then dispatches the binary workflow. The binary workflow builds and
 uploads the four binaries and `SHA256SUMS`, then generates and pushes the
-Homebrew formula and the AUR `termurl-bin` package automatically.
+Homebrew formula and the signed pacman packages automatically.
 
 The termurl repository must have these Actions secrets:
 
-- `PACKAGES_REPO_PAT`: permission to push to `msegoviadev/homebrew-tap`.
-- `AUR_SSH_PRIVATE_KEY`: private half of an SSH keypair whose public half is
-  registered on the AUR account maintaining `termurl-bin`.
+- `PACKAGES_REPO_PAT`: permission to push to `msegoviadev/homebrew-tap` and
+  `msegoviadev/pacman-repo`.
+- `PACMAN_REPO_GPG_KEY`: ASCII-armored private half of the key signing the
+  `msegoviadev` pacman repository (fingerprint
+  `ABD517389B8A1447971AE05F7A1E0EC939A79CBC`, UID
+  `msegoviadev (pacman repo) <contact@msegovia.dev>`). The public half is
+  published as `msegoviadev.asc` in pacman-repo.
 
-The Homebrew formula and AUR package must not be updated with placeholder
+The Homebrew formula and pacman packages must not be updated with placeholder
 checksums. The release assets and their checksums must exist first.
 
-## AUR one-time registration
+## pacman repository
 
-The AUR package `termurl-bin` must exist before the workflow can push to it:
+The `msegoviadev` pacman repository is multi-package: any project can reuse
+the same `publish-pacman-repo` job, GPG key, and PAT to publish into it.
+Users who added the repo once get every package in it via plain `pacman -S`.
+Old package versions stay on the `gh-pages` branch, so downgrades via
+`pacman -U` against an older package URL remain possible.
 
-1. Create an AUR account and add the public half of a dedicated keypair
-   (`ssh-keygen -t ed25519 -f ~/.ssh/aur-termurl`) to the account profile.
-2. Add the private half as the `AUR_SSH_PRIVATE_KEY` Actions secret.
-3. Push the validated `aur/termurl-bin/` contents (PKGBUILD and .SRCINFO)
-   from this repository:
+`pacman/termurl/PKGBUILD` in this repository is the reference recipe; CI
+regenerates it per release with real checksums before running `makepkg`. The
+aarch64 package is cross-built without qemu by overriding `CARCH` through a
+custom makepkg.conf, which works because the package only wraps a prebuilt
+binary. The `options` entry disabling `strip` is load-bearing:
+`bun build --compile` embeds the application bundle in the binary and
+stripping removes it.
 
-   ```bash
-   git clone ssh://aur@aur.archlinux.org/termurl-bin.git
-   cp aur/termurl-bin/PKGBUILD aur/termurl-bin/.SRCINFO termurl-bin/
-   cd termurl-bin && git add . && git commit -m "Initial termurl-bin" && git push
-   ```
+The signing key was generated with:
 
-   The first push creates the package with the pushing account as maintainer.
-   `aur/termurl-bin/PKGBUILD` in this repository is the reference recipe; CI
-   regenerates both files per release with real checksums. The `options`
-   entry disabling `strip` is load-bearing: `bun build --compile` embeds the
-   application bundle in the binary and stripping removes it.
+```bash
+gpg --quick-gen-key "msegoviadev (pacman repo) <contact@msegovia.dev>" ed25519 sign never
+```
+
+If the key ever rotates, update the fingerprint in this file, in the README,
+in `pacman-repo/README.md`, and republish `msegoviadev.asc`.
