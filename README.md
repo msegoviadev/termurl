@@ -71,6 +71,20 @@ termurl ./my-apis
 The collection path is only an override for that run. The config must still
 exist.
 
+### Configuration
+
+`~/.config/termurl/config.toml` accepts these keys:
+
+- `collection`: path to the hurl collection (set by `termurl init`).
+- `environment`: environment selected on startup (defaults to the first one).
+- `theme`: set to `system` to follow the active Omarchy theme. On Linux the
+  palette is read from the current theme's `colors.toml`
+  (`$XDG_STATE_HOME/omarchy/current/theme/colors.toml`), so every stock and
+  custom Omarchy theme is supported. On other platforms, or when the file is
+  missing, the built-in Tokyo Night palette is used.
+
+Changes to `theme` apply on the next launch.
+
 ### TUI workflow
 
 1. Browse requests in the workspace window.

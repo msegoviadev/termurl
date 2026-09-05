@@ -155,7 +155,21 @@ if (environments.length === 0) environments.push("dev");
 let environmentIdx = Math.max(0, environments.indexOf(CONFIG.environment ?? ""));
 let cliVariables: Record<string, string> = {};
 
-const C = {
+type Palette = {
+  bg: string;
+  fg: string;
+  dim: string;
+  yellow: string;
+  green: string;
+  red: string;
+  blue: string;
+  cyan: string;
+  panel: string;
+  selected: string;
+  active: string;
+};
+
+const DEFAULT_PALETTE: Palette = {
   bg: "#1a1b26",
   fg: "#c0caf5",
   dim: "#565f89",
@@ -164,7 +178,43 @@ const C = {
   red: "#f7768e",
   blue: "#7aa2f7",
   cyan: "#7dcfff",
+  panel: "#24283b",
+  selected: "#292e42",
+  active: "#3b4261",
 };
+
+const OMARCHY_COLORS_FILE = join(process.env.XDG_STATE_HOME ?? join(homedir(), ".local/state"), "omarchy", "current", "theme", "colors.toml");
+
+function loadOmarchyPalette(): Palette | null {
+  if (process.platform !== "linux") return null;
+  let colors: Record<string, string>;
+  try {
+    colors = parseVariables(readFileSync(OMARCHY_COLORS_FILE, "utf8"));
+  } catch {
+    return null;
+  }
+  const hex = (value: string | undefined, fallback: string) => (value && /^#[0-9a-fA-F]{6}$/.test(value) ? value : fallback);
+  return {
+    bg: hex(colors.background, DEFAULT_PALETTE.bg),
+    fg: hex(colors.bright_foreground, DEFAULT_PALETTE.fg),
+    dim: hex(colors.dark_foreground, DEFAULT_PALETTE.dim),
+    yellow: hex(colors.yellow, DEFAULT_PALETTE.yellow),
+    green: hex(colors.green, DEFAULT_PALETTE.green),
+    red: hex(colors.red, DEFAULT_PALETTE.red),
+    blue: hex(colors.blue, DEFAULT_PALETTE.blue),
+    cyan: hex(colors.bright_cyan ?? colors.cyan, DEFAULT_PALETTE.cyan),
+    panel: hex(colors.lighter_background, DEFAULT_PALETTE.panel),
+    selected: hex(colors.selection, DEFAULT_PALETTE.selected),
+    active: hex(colors.muted, DEFAULT_PALETTE.active),
+  };
+}
+
+function resolvePalette(config: Record<string, string>): Palette {
+  if (config.theme === "system") return loadOmarchyPalette() ?? DEFAULT_PALETTE;
+  return DEFAULT_PALETTE;
+}
+
+const C = resolvePalette(CONFIG);
 
 type Req = { name: string; file: string; desc: string; method: string; path: string; vars: string[]; variants: string[] };
 
@@ -918,7 +968,7 @@ renderer.root.add(root);
 const tabBar = new TextRenderable(renderer, {
   content: "",
   height: 1,
-  backgroundColor: "#24283b",
+  backgroundColor: C.panel,
   selectable: false,
 } as any);
 root.add(tabBar);
@@ -971,7 +1021,7 @@ const editor = new TextareaRenderable(renderer, {
 editorBox.add(editor);
 
 const variantStrip = new BoxRenderable(renderer, {
-  height: 1, flexShrink: 0, flexDirection: "row", backgroundColor: "#24283b", visible: false,
+  height: 1, flexShrink: 0, flexDirection: "row", backgroundColor: C.panel, visible: false,
 } as any);
 rightCol.add(variantStrip);
 
@@ -998,7 +1048,7 @@ respView.onKeyDown = (key) => key.preventDefault();
 respView.onPaste = (event) => event.preventDefault();
 responseBox.add(respView);
 
-const statusBar = new TextRenderable(renderer, { content: "", height: 1, backgroundColor: "#24283b", selectable: false } as any);
+const statusBar = new TextRenderable(renderer, { content: "", height: 1, backgroundColor: C.panel, selectable: false } as any);
 
 const historyWindow = new BoxRenderable(renderer, {
   flexDirection: "row",
@@ -1243,7 +1293,7 @@ function renderVariantStrip(req: Req | null) {
   if (!req || !show) return;
   const active = currentVariant(req);
   variantStrip.add(new TextRenderable(renderer, {
-    content: " variants: ", height: 1, fg: C.dim, bg: "#24283b", selectable: false,
+    content: " variants: ", height: 1, fg: C.dim, bg: C.panel, selectable: false,
   }));
   for (const name of variantOptions(req)) {
     const isActive = name === undefined ? active === undefined : name === active;
@@ -1251,13 +1301,13 @@ function renderVariantStrip(req: Req | null) {
       content: ` ${name ?? "default"} `,
       height: 1,
       fg: isActive ? C.fg : C.dim,
-      bg: isActive ? "#3b4261" : "#24283b",
+      bg: isActive ? C.active : C.panel,
       selectable: false,
     });
     segment.onMouseDown = () => { if (!insert) setVariant(req, name); };
     variantStrip.add(segment);
     variantStrip.add(new TextRenderable(renderer, {
-      content: " ", height: 1, fg: C.dim, bg: "#24283b", selectable: false,
+      content: " ", height: 1, fg: C.dim, bg: C.panel, selectable: false,
     }));
   }
 }
@@ -1398,7 +1448,7 @@ function renderEnvironments() {
       width: "100%",
       height: 1,
       fg: active ? C.green : C.fg,
-      bg: selected ? "#292e42" : C.bg,
+      bg: selected ? C.selected : C.bg,
       truncate: true,
       selectable: false,
     });
@@ -1532,7 +1582,7 @@ function renderHistory() {
       width: "100%",
       height: 1,
       fg: index === selectedHistory ? C.fg : C.dim,
-      bg: index === selectedHistory ? "#292e42" : C.bg,
+      bg: index === selectedHistory ? C.selected : C.bg,
       truncate: true,
       selectable: false,
     });
@@ -1683,7 +1733,7 @@ function renderTree() {
       width: "100%",
       height: 1,
       fg: row.type === "folder" ? C.cyan : C.fg,
-      bg: selected ? "#292e42" : C.bg,
+      bg: selected ? C.selected : C.bg,
       truncate: true,
       selectable: false,
     });
@@ -1978,7 +2028,7 @@ function leaveInsert() {
 
 function updateVisualSelection(target: TextareaRenderable) {
   const eb = target.editBuffer;
-  target.selectionBg = RGBA.fromHex("#3b4261");
+  target.selectionBg = RGBA.fromHex(C.active);
   target.selectionFg = RGBA.fromHex(C.fg);
   if (visualKind === "char") {
     const { row, col } = eb.getCursorPosition();

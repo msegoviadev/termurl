@@ -25,6 +25,7 @@
 - `skills/termurl/SKILL.md` documents the minimum agent workflow: doctor, discover, inspect, choose an environment, and run explicitly named requests.
 - Flow execution: queued requests are concatenated into one temp `.hurl` file, with `[Options] output:` injected per request to capture bodies. Captures (e.g. `token`) feed later requests in queue order. Queue keys are `name` or `name@variant`; `resolveKey` turns them back into run targets.
 - Both `config.toml` and environment dotfiles are parsed by the same hand-rolled `KEY=value` parser (`parseVariables`). Keep both to simple `key = "value"` or `KEY=value` lines; no TOML sections, no multiline values.
+- Colors come from a single `Palette` object `C` resolved by `resolvePalette(CONFIG)` before any renderable is constructed; never hardcode hex literals elsewhere. Config `theme = "system"` (Linux only) maps the active Omarchy theme's `colors.toml` (`$XDG_STATE_HOME/omarchy/current/theme/colors.toml`, parsed by `parseVariables`) onto the palette; any failure or other `theme` value falls back to `DEFAULT_PALETTE` (Tokyo Night).
 
 ## Conventions
 
