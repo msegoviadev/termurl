@@ -11,7 +11,7 @@ import {
 } from "@opentui/core";
 import packageJson from "./package.json" with { type: "json" };
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, readdirSync, statSync, rmSync, watch } from "fs";
-import { join, relative, resolve } from "path";
+import { join, relative, resolve, dirname } from "path";
 import { homedir, tmpdir } from "os";
 import * as readline from "node:readline/promises";
 
@@ -1314,17 +1314,24 @@ function renderVariantStrip(req: Req | null) {
 
 type VariableSource = "file" | "secret" | "capture" | "unresolved";
 
-const variableSyntax = SyntaxStyle.fromStyles({
-  file: { fg: C.green },
-  secret: { fg: C.yellow },
-  capture: { fg: C.blue },
-  unresolved: { fg: C.red },
-});
+function buildVariableSyntax(): SyntaxStyle {
+  return SyntaxStyle.fromStyles({
+    file: { fg: C.green },
+    secret: { fg: C.yellow },
+    capture: { fg: C.blue },
+    unresolved: { fg: C.red },
+  });
+}
 
-const responseFailureSyntax = SyntaxStyle.fromStyles({
-  failure: { fg: C.red },
-  label: { fg: C.cyan, bold: true },
-});
+function buildResponseFailureSyntax(): SyntaxStyle {
+  return SyntaxStyle.fromStyles({
+    failure: { fg: C.red },
+    label: { fg: C.cyan, bold: true },
+  });
+}
+
+let variableSyntax = buildVariableSyntax();
+let responseFailureSyntax = buildResponseFailureSyntax();
 
 function applyResponseHighlights(target: TextareaRenderable, text: string, failed: boolean) {
   target.editBuffer.setSyntaxStyle(responseFailureSyntax);
@@ -1383,7 +1390,10 @@ function applyResponseHighlights(target: TextareaRenderable, text: string, faile
   if (!highlighted) highlightRange(0, text.length, styleId);
 }
 
+let lastResponse: { text: string; failed: boolean } | null = null;
+
 function renderResponse(text: string, failed: boolean) {
+  lastResponse = { text, failed };
   respView.setText(text);
   applyResponseHighlights(respView, text, failed);
 }
@@ -1787,6 +1797,93 @@ function watchCollection() {
         refreshList(undefined, appWindow === "workspace" && !insert);
       }, 150);
     });
+  } catch {}
+}
+
+function applyPalette() {
+  Object.assign(C, resolvePalette(CONFIG));
+  renderer.setBackgroundColor(C.bg);
+  tabBar.bg = C.panel;
+  statusBar.bg = C.panel;
+  listBox.backgroundColor = C.bg;
+  verticalDivider.backgroundColor = C.bg;
+  filterInput.textColor = C.fg;
+  treeList.backgroundColor = C.bg;
+  editorBox.backgroundColor = C.bg;
+  editor.backgroundColor = C.bg;
+  editor.textColor = C.fg;
+  variantStrip.backgroundColor = C.panel;
+  horizontalDivider.backgroundColor = C.bg;
+  responseBox.backgroundColor = C.bg;
+  respView.backgroundColor = C.bg;
+  respView.textColor = C.fg;
+  historyWindow.backgroundColor = C.bg;
+  historyListBox.backgroundColor = C.bg;
+  historyDivider.backgroundColor = C.bg;
+  historyList.backgroundColor = C.bg;
+  historyDetailBox.backgroundColor = C.bg;
+  historyDetail.backgroundColor = C.bg;
+  historyDetail.textColor = C.fg;
+  envWindow.backgroundColor = C.bg;
+  envListBox.backgroundColor = C.bg;
+  environmentDivider.backgroundColor = C.bg;
+  envList.backgroundColor = C.bg;
+  envDetailBox.backgroundColor = C.bg;
+  envDetail.backgroundColor = C.bg;
+  envDetail.textColor = C.fg;
+  helpBackdrop.backgroundColor = C.bg;
+  helpOverlay.borderColor = C.yellow;
+  helpOverlay.backgroundColor = C.bg;
+  helpText.textColor = C.fg;
+  listBox.borderColor = appWindow === "workspace" && pane === "list" ? C.yellow : C.dim;
+  editorBox.borderColor = appWindow === "workspace" && pane === "editor" ? C.yellow : C.dim;
+  responseBox.borderColor = appWindow === "workspace" && pane === "response" ? C.yellow : C.dim;
+  historyListBox.borderColor = appWindow === "history" && historyPane === "list" ? C.yellow : C.dim;
+  historyDetailBox.borderColor = appWindow === "history" && historyPane === "detail" ? C.yellow : C.dim;
+  envListBox.borderColor = appWindow === "environments" && envPane === "list" ? C.yellow : C.dim;
+  envDetailBox.borderColor = appWindow === "environments" && envPane === "editor" ? C.yellow : C.dim;
+  variableSyntax = buildVariableSyntax();
+  responseFailureSyntax = buildResponseFailureSyntax();
+  refreshEditorHighlights();
+  if (lastResponse) applyResponseHighlights(respView, lastResponse.text, lastResponse.failed);
+  renderTree();
+  renderEnvironments();
+  if (historyGroups.length > 0) renderHistory();
+  renderVariantStrip(currentReq());
+  if (visual && visualTarget) updateVisualSelection(visualTarget);
+  setStatus();
+}
+
+function watchOmarchyTheme() {
+  if (CONFIG.theme !== "system" || process.platform !== "linux") return;
+  const themeDir = dirname(OMARCHY_COLORS_FILE);
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let themeWatcher: ReturnType<typeof watch> | null = null;
+  const watchThemeDir = () => {
+    try { themeWatcher?.close(); } catch {}
+    try {
+      themeWatcher = watch(themeDir, (_event, filename) => {
+        if (filename && filename !== "colors.toml") return;
+        schedule();
+      });
+      themeWatcher.on("error", () => {});
+    } catch {
+      themeWatcher = null;
+    }
+  };
+  const schedule = () => {
+    if (timer) clearTimeout(timer);
+    // omarchy swaps the whole theme directory via rename, which kills the
+    // directory watcher's inode, so re-establish it on every change.
+    timer = setTimeout(() => { watchThemeDir(); applyPalette(); }, 150);
+  };
+  watchThemeDir();
+  try {
+    const parentWatcher = watch(dirname(themeDir), (_event, filename) => {
+      if (filename && filename !== "theme") return;
+      schedule();
+    });
+    parentWatcher.on("error", () => {});
   } catch {}
 }
 
@@ -2612,4 +2709,5 @@ setStatus();
 setWindow("workspace");
 setPane("list");
 watchCollection();
+watchOmarchyTheme();
 renderer.start();
