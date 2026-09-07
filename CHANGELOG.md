@@ -2,6 +2,14 @@
 
 All notable changes to termurl are documented here.
 
+## [0.3.0](https://github.com/msegoviadev/termurl/compare/v0.2.0...v0.3.0) (2026-09-07)
+
+
+### Features
+
+* follow omarchy theme with theme = "system" ([ddf53a9](https://github.com/msegoviadev/termurl/commit/ddf53a99b924a0e14a32cac68a2f19afbc62c728))
+* live-reload palette on omarchy theme switch ([1dee4d1](https://github.com/msegoviadev/termurl/commit/1dee4d17f08bf3a2806d5f4d08d61c1d620270be))
+
 ## [0.2.0](https://github.com/msegoviadev/termurl/compare/v0.1.0...v0.2.0) (2026-09-05)
 
 
