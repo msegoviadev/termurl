@@ -2,6 +2,18 @@
 
 All notable changes to termurl are documented here.
 
+## [0.4.0](https://github.com/msegoviadev/termurl/compare/v0.3.0...v0.4.0) (2026-09-11)
+
+
+### Features
+
+* dirty buffer tracking, vim command line, and mode titles ([da61de3](https://github.com/msegoviadev/termurl/commit/da61de33b340a466f97fa42e0e4816943b99376c))
+
+
+### Bug Fixes
+
+* update focused textarea colors on theme switch ([77e18a7](https://github.com/msegoviadev/termurl/commit/77e18a7bc9b729b0108a668ab4ffe2b04958e427))
+
 ## [0.3.0](https://github.com/msegoviadev/termurl/compare/v0.2.0...v0.3.0) (2026-09-07)
 
 
