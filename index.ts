@@ -888,6 +888,11 @@ const lastResult = new Map<string, "ok" | "fail">();
 const lastBodies = new Map<string, string>();
 const activeVariant = new Map<string, string>();
 let editorEntry: { reqName: string; variant?: string } | null = null;
+let editorSavedText = "";
+let envSavedText = "";
+let envMasked = true;
+let envLoadedName: string | null = null;
+let commandBuffer: string | null = null;
 type Pane = "list" | "editor" | "response";
 let pane: Pane = "list";
 let insert = false;
@@ -1243,7 +1248,74 @@ function currentVariant(req: Req): string | undefined {
   return variant && req.variants.includes(variant) ? variant : undefined;
 }
 
-function requestTitle(insertMode = false): string {
+function editorDirty(): boolean {
+  return editorEntry !== null && editor.plainText !== editorSavedText;
+}
+
+function envDirty(): boolean {
+  return !envMasked && envDetail.plainText !== envSavedText;
+}
+
+function diffStats(saved: string, current: string): { added: number; removed: number } {
+  const a = saved.split("\n");
+  const b = current.split("\n");
+  let start = 0;
+  while (start < a.length && start < b.length && a[start] === b[start]) start++;
+  let endA = a.length;
+  let endB = b.length;
+  while (endA > start && endB > start && a[endA - 1] === b[endB - 1]) { endA--; endB--; }
+  return { added: endB - start, removed: endA - start };
+}
+
+function dirtyBufferInfos(): { name: string; added: number; removed: number }[] {
+  const infos: { name: string; added: number; removed: number }[] = [];
+  if (editorDirty() && editorEntry) infos.push({ name: editorEntry.reqName, ...diffStats(editorSavedText, editor.plainText) });
+  if (envDirty()) infos.push({ name: `.env.${envLoadedName}`, ...diffStats(envSavedText, envDetail.plainText) });
+  return infos;
+}
+
+function dirtyBufferName(): string | null {
+  return dirtyBufferInfos()[0]?.name ?? null;
+}
+
+function dirtyBufferLabel(): string {
+  return dirtyBufferInfos()
+    .map(({ name, added, removed }) => {
+      const stats = [added > 0 ? `+${added}` : "", removed > 0 ? `-${removed}` : ""].filter(Boolean).join(" ");
+      return `[${name}${stats ? ` ${stats}` : "+"}]`;
+    })
+    .join(" ");
+}
+
+function warnDirty(name: string) {
+  statusMsg = `unsaved changes in ${name} (:w to save, :q! to discard)`;
+  setStatus();
+}
+
+function focusDirtyBuffer(name: string) {
+  if (name.startsWith(".env.")) {
+    const envName = name.slice(".env.".length);
+    setWindow("environments");
+    const idx = environments.indexOf(envName);
+    if (idx >= 0) {
+      selectedEnvironment = idx;
+      renderEnvironments();
+      setEnvPane("editor");
+    }
+  } else {
+    setWindow("workspace");
+    const idx = treeRows.findIndex((row) => row.type === "request" && row.req.name === name);
+    if (idx >= 0) {
+      selectedRow = idx;
+      renderTree();
+    }
+    setPane("editor");
+  }
+  statusMsg = `unsaved changes in ${name} (:w to save, :q! to quit anyway)`;
+  setStatus();
+}
+
+function requestTitle(insertMode = false, visualMode = false): string {
   const req = currentReq();
   const variant = req ? currentVariant(req) : undefined;
   const base = req && variant
@@ -1251,14 +1323,23 @@ function requestTitle(insertMode = false): string {
     : req && req.variants.length > 0
       ? `REQUEST (${req.name} +${req.variants.length})`
       : "REQUEST";
-  return insertMode ? ` ${base} (INSERT) ` : ` ${base} `;
+  const dirty = editorDirty() ? " [+]" : "";
+  const mode = visualMode ? " (VISUAL)" : insertMode ? " (INSERT)" : "";
+  return ` ${base}${dirty}${mode} `;
 }
 
-function loadEditorEntry(req: Req) {
+function loadEditorEntry(req: Req, force = false) {
   const variant = currentVariant(req);
+  if (!force && editorDirty() && editorEntry && editorEntry.reqName === req.name && editorEntry.variant === variant) {
+    syncModeTitles();
+    renderVariantStrip(req);
+    return;
+  }
   editorEntry = { reqName: req.name, variant };
-  editor.setText(entrySource(req, variant));
-  editorBox.title = requestTitle(insert);
+  const text = entrySource(req, variant);
+  editorSavedText = text;
+  editor.setText(text);
+  syncModeTitles();
   renderVariantStrip(req);
   refreshEditorHighlights();
 }
@@ -1268,6 +1349,10 @@ function variantOptions(req: Req): (string | undefined)[] {
 }
 
 function setVariant(req: Req, name: string | undefined) {
+  if (editorDirty()) {
+    warnDirty(editorEntry?.reqName ?? req.name);
+    return;
+  }
   if (name) activeVariant.set(req.name, name);
   else activeVariant.delete(req.name);
   loadEditorEntry(req);
@@ -1278,6 +1363,10 @@ function setVariant(req: Req, name: string | undefined) {
 function cycleVariant(delta: number) {
   const req = currentReq();
   if (!req || req.variants.length === 0 || insert) return;
+  if (editorDirty()) {
+    warnDirty(editorEntry?.reqName ?? req.name);
+    return;
+  }
   const options = variantOptions(req);
   const index = options.indexOf(currentVariant(req));
   setVariant(req, options[(index + delta + options.length) % options.length]);
@@ -1428,14 +1517,16 @@ function renderTabs() {
   tabBar.content = ` ${tab("1", "Workspace", appWindow === "workspace")} ${tab("2", "History", appWindow === "history")} ${tab("3", "Environments", appWindow === "environments")}    env: ${environments[environmentIdx]}`;
 }
 
-function envTitle(state: "list" | "editor" | "insert"): string {
+function envTitle(state: "list" | "editor" | "insert" | "visual"): string {
   const base = `ENVIRONMENT (.env.${environments[selectedEnvironment]})`;
-  if (state === "insert") return ` ${base} · INSERT `;
-  if (state === "editor") return ` ${base} `;
+  const dirty = envDirty() ? " [+]" : "";
+  if (state === "insert") return ` ${base}${dirty} · INSERT `;
+  if (state === "visual") return ` ${base}${dirty} · VISUAL `;
+  if (state === "editor") return ` ${base}${dirty} `;
   const text = environmentVariables(environments[selectedEnvironment]);
   const hasSecrets = Object.keys(text).some((key) => /^secret_/i.test(key));
-  if (hasSecrets) return ` ${base} ${secretsRevealed ? "[revealed]" : "[masked]"} `;
-  return ` ${base} `;
+  if (hasSecrets) return ` ${base}${dirty} ${secretsRevealed ? "[revealed]" : "[masked]"} `;
+  return ` ${base}${dirty} `;
 }
 
 function maskSecretsText(text: string): string {
@@ -1464,6 +1555,10 @@ function renderEnvironments() {
     });
     rowRenderable.onMouseDown = () => {
       if (appWindow === "environments" && envPane !== "list") setEnvPane("list");
+      if (envDirty() && environments[index] !== envLoadedName) {
+        warnDirty(`.env.${envLoadedName}`);
+        return;
+      }
       selectedEnvironment = index;
       renderEnvironments();
       loadEnvironmentFile();
@@ -1472,17 +1567,34 @@ function renderEnvironments() {
   });
 }
 
-function loadEnvironmentFile() {
+function loadEnvironmentFile(force = false) {
+  const name = environments[selectedEnvironment];
+  if (!force && envDirty() && envLoadedName === name) {
+    if (envPane === "list" && !envInsert) envDetailBox.title = envTitle("list");
+    return;
+  }
   let text = "";
-  try { text = readFileSync(environmentFile(environments[selectedEnvironment]), "utf8"); } catch {}
-  envDetail.setText(envPane === "list" && !secretsRevealed ? maskSecretsText(text) : text);
+  try { text = readFileSync(environmentFile(name), "utf8"); } catch {}
+  envLoadedName = name;
+  envSavedText = text;
+  envMasked = envPane === "list" && !secretsRevealed;
+  envDetail.setText(envMasked ? maskSecretsText(text) : text);
   if (envPane === "list" && !envInsert) envDetailBox.title = envTitle("list");
 }
 
 function saveEnvironmentFile() {
+  if (envMasked) {
+    statusMsg = "buffer is masked, open the editor to save";
+    setStatus();
+    return;
+  }
   const name = environments[selectedEnvironment];
+  envSavedText = envDetail.plainText;
+  envMasked = false;
+  envLoadedName = name;
   writeFileSync(environmentFile(name), envDetail.plainText);
   statusMsg = `saved .env.${name}`;
+  syncModeTitles();
   refreshEditorHighlights();
   setStatus();
   setTimeout(() => { statusMsg = ""; setStatus(); }, 2000);
@@ -1490,7 +1602,7 @@ function saveEnvironmentFile() {
 
 function enterEnvInsert() {
   envInsert = true;
-  envDetailBox.title = envTitle("insert");
+  syncModeTitles();
   envDetail.focus();
   setStatus();
 }
@@ -1498,7 +1610,7 @@ function enterEnvInsert() {
 function leaveEnvInsert() {
   envInsert = false;
   envPane = "editor";
-  envDetailBox.title = envTitle("editor");
+  syncModeTitles();
   envDetail.focus();
   setStatus();
 }
@@ -1506,6 +1618,7 @@ function leaveEnvInsert() {
 function setEnvPane(next: EnvPane) {
   clearVisual();
   pending = null;
+  commandBuffer = null;
   envInsert = false;
   envPane = next;
   envListBox.borderColor = next === "list" ? C.yellow : C.dim;
@@ -1752,6 +1865,10 @@ function renderTree() {
       const now = Date.now();
       const doubleClick = lastRowClick.index === index && now - lastRowClick.time < 400;
       lastRowClick = { index, time: now };
+      if (row.type === "request" && editorDirty() && editorEntry && row.req.name !== editorEntry.reqName) {
+        warnDirty(editorEntry.reqName);
+        return;
+      }
       selectedRow = index;
       if (row.type === "folder") {
         collapsed.has(row.path) ? collapsed.delete(row.path) : collapsed.add(row.path);
@@ -1794,7 +1911,7 @@ function watchCollection() {
       if (timer) clearTimeout(timer);
       timer = setTimeout(() => {
         requests.splice(0, requests.length, ...loadRequests());
-        refreshList(undefined, appWindow === "workspace" && !insert);
+        refreshList(undefined, appWindow === "workspace" && !insert && !editorDirty());
       }, 150);
     });
   } catch {}
@@ -1889,7 +2006,14 @@ function watchOmarchyTheme() {
 
 function moveSelection(delta: number) {
   if (treeRows.length === 0) return;
-  selectedRow = Math.max(0, Math.min(treeRows.length - 1, selectedRow + delta));
+  const next = Math.max(0, Math.min(treeRows.length - 1, selectedRow + delta));
+  const targetRow = treeRows[next];
+  const targetName = targetRow?.type === "request" ? targetRow.req.name : null;
+  if (editorDirty() && editorEntry && targetName !== editorEntry.reqName) {
+    warnDirty(editorEntry.reqName);
+    return;
+  }
+  selectedRow = next;
   const req = currentReq();
   if (req) loadEditorEntry(req);
   renderTree();
@@ -1906,11 +2030,21 @@ function activateSelection() {
   void runRequest(row.req);
 }
 
+function syncModeTitles() {
+  editorBox.title = requestTitle(insert, visual && visualTarget === editor);
+  responseBox.title = visual && visualTarget === respView ? " RESPONSE (VISUAL) " : " RESPONSE ";
+  historyDetailBox.title = visual && visualTarget === historyDetail ? " RUN DETAILS (VISUAL) " : " RUN DETAILS ";
+  if (envPane === "editor" || envInsert) {
+    envDetailBox.title = envTitle(envInsert ? "insert" : visual && visualTarget === envDetail ? "visual" : "editor");
+  }
+}
+
 function clearVisual() {
   if (visualTarget) visualTarget.clearSelection();
   visual = false;
   visualKind = null;
   visualTarget = null;
+  syncModeTitles();
 }
 
 function yankNativeSelection(target: TextareaRenderable): boolean {
@@ -1948,13 +2082,21 @@ function ensureCursorVisible(target: TextareaRenderable) {
 }
 
 function setStatus() {
+  renderTabs();
+  const dirtyInfos = dirtyBufferInfos();
+  statusBar.fg = dirtyInfos.length > 0 ? C.yellow : C.fg;
+  if (commandBuffer !== null) {
+    statusBar.content = `:${commandBuffer}`;
+    return;
+  }
   const mode = appWindow === "history" ? (historyPane === "detail" ? (visual ? "VISUAL" : "RUN-DETAILS") : "HISTORY") : appWindow === "environments" ? (envInsert ? "ENV-INSERT" : envPane === "editor" ? "ENV-NORMAL" : "ENVIRONMENTS") : pane === "editor"
     ? (insert ? "INSERT" : visual ? "REQ-VISUAL" : "REQ-NORMAL")
     : pane === "response" && visual ? "VISUAL" : pane.toUpperCase();
   const last = [...lastResult.entries()].slice(-1)[0];
-  renderTabs();
   statusBar.content =
-    ` ${appWindow === "workspace" ? "1 WORKSPACE" : appWindow === "history" ? "2 HISTORY" : "3 ENVIRONMENTS"} · ${mode} · env: ${environments[environmentIdx]} · queued: ${flowQueue.size}` +
+    ` ${appWindow === "workspace" ? "1 WORKSPACE" : appWindow === "history" ? "2 HISTORY" : "3 ENVIRONMENTS"} · ${mode}` +
+    (dirtyInfos.length > 0 ? ` ${dirtyBufferLabel()}` : "") +
+    ` · env: ${environments[environmentIdx]} · queued: ${flowQueue.size}` +
     (last ? ` · last: ${last[0]} ${last[1] === "ok" ? "✓" : "✗"}` : "") +
     (statusMsg ? ` · ${statusMsg}` : "") +
     (pending ? ` · ${pending}` : "") +
@@ -1964,6 +2106,7 @@ function setStatus() {
 function setPane(p: Pane) {
   clearVisual();
   filterInput.blur();
+  commandBuffer = null;
   pane = p;
   insert = false;
   listBox.borderColor = p === "list" ? C.yellow : C.dim;
@@ -1994,6 +2137,7 @@ function setHistoryPane(next: HistoryPane) {
 function setWindow(next: AppWindow) {
   clearVisual();
   filterInput.blur();
+  commandBuffer = null;
   editor.blur();
   respView.blur();
   historyDetail.blur();
@@ -2013,6 +2157,13 @@ function setWindow(next: AppWindow) {
     envDetailBox.borderColor = C.dim;
   } else if (next === "environments") {
     selectedEnvironment = environmentIdx;
+    if (envDirty() && envLoadedName && envLoadedName !== environments[environmentIdx]) {
+      const idx = environments.indexOf(envLoadedName);
+      if (idx >= 0) {
+        selectedEnvironment = idx;
+        statusMsg = `unsaved changes in .env.${envLoadedName} (:w to save, :q! to discard)`;
+      }
+    }
     envPane = "list";
     renderEnvironments();
     loadEnvironmentFile();
@@ -2109,17 +2260,17 @@ async function runFlow() {
   setStatus();
 }
 
-function enterInsert(title = requestTitle(true)) {
+function enterInsert() {
   insert = true;
   pending = null;
-  editorBox.title = title;
+  syncModeTitles();
   setStatus();
 }
 
 function leaveInsert() {
   insert = false;
   pending = null;
-  editorBox.title = requestTitle();
+  syncModeTitles();
   setStatus();
 }
 
@@ -2152,6 +2303,7 @@ function enterVisual(target: TextareaRenderable, kind: "char" | "line") {
   visualAnchor = cursor.row;
   visualAnchorOffset = target.editBuffer.positionToOffset(cursor.row, cursor.col);
   updateVisualSelection(target);
+  syncModeTitles();
   setStatus();
 }
 
@@ -2299,9 +2451,79 @@ function saveEditor() {
   const tail = src.slice(entry.end);
   const next = src.slice(0, entry.start) + text + (tail ? "\n\n" : "\n") + tail;
   writeFileSync(req.file, next);
+  editorSavedText = editor.plainText;
+  syncModeTitles();
   statusMsg = `saved ${targetKey(req, editorEntry.variant)}`;
   setStatus();
   setTimeout(() => { statusMsg = ""; setStatus(); }, 2000);
+}
+
+function enterCommandLine() {
+  commandBuffer = "";
+  pending = null;
+  listPending = null;
+  setStatus();
+}
+
+function runCommandLine(cmd: string) {
+  const c = cmd.trim();
+  const inEnvWindow = appWindow === "environments";
+  const inEnvEditor = inEnvWindow && envPane === "editor";
+  const inReqEditor = appWindow === "workspace" && pane === "editor";
+  if (c === "") return;
+  if (c === "w") {
+    if (inEnvWindow) saveEnvironmentFile();
+    else saveEditor();
+    return;
+  }
+  if (c === "wq" || c === "x") {
+    if (inEnvEditor) {
+      saveEnvironmentFile();
+      setEnvPane("list");
+    } else if (inReqEditor) {
+      saveEditor();
+      setPane("list");
+    } else {
+      if (inEnvWindow) saveEnvironmentFile();
+      else saveEditor();
+      renderer.destroy();
+      process.exit(0);
+    }
+    return;
+  }
+  if (c === "q" || c === "q!") {
+    const force = c === "q!";
+    if (inEnvEditor) {
+      if (envDirty() && !force) {
+        statusMsg = "no write since last change (add ! to override)";
+        setStatus();
+        return;
+      }
+      if (envDirty()) loadEnvironmentFile(true);
+      setEnvPane("list");
+      return;
+    }
+    if (inReqEditor) {
+      if (editorDirty() && !force) {
+        statusMsg = "no write since last change (add ! to override)";
+        setStatus();
+        return;
+      }
+      const req = currentReq();
+      if (editorDirty() && req) loadEditorEntry(req, true);
+      setPane("list");
+      return;
+    }
+    const dirtyName = dirtyBufferName();
+    if (dirtyName && !force) {
+      focusDirtyBuffer(dirtyName);
+      return;
+    }
+    renderer.destroy();
+    process.exit(0);
+  }
+  statusMsg = `not an editor command: ${c}`;
+  setStatus();
 }
 
 const VIM_MOVE: [string, string][] = [
@@ -2343,13 +2565,16 @@ const PANE_HELP: Record<string, [string, string][]> = {
     ["ctrl-x", "delete request"],
     ["ctrl-p", "cycle environment"],
     ["alt+hjkl / alt-0", "resize panes / reset"],
+    [":q / :q!", "quit (bang discards unsaved changes)"],
     ["q", "quit"],
   ],
   editor: [
     ...VIM_MOVE,
     ...VIM_EDIT,
     ["[ / ]", "previous / next variant"],
-    ["ctrl-s", "save"],
+    ["ctrl-s / :w", "save"],
+    [":wq / :x", "save and close pane"],
+    [":q / :q!", "close pane (bang discards changes)"],
     ["ctrl-l / ctrl-h", "next pane (response) / prev pane (list)"],
     ["alt+hjkl / alt-0", "resize panes / reset"],
     ["esc", "leave insert / cancel visual / back to list"],
@@ -2369,7 +2594,7 @@ const PANE_HELP: Record<string, [string, string][]> = {
     ["j / k", "move"],
     ["g / G", "jump to top / bottom"],
     ["ctrl-d / ctrl-u", "jump 5 up / down"],
-    ["enter / ctrl-l", "open details"],
+    ["enter / l / ctrl-l", "open details"],
     ["y", "copy all"],
     ["alt+hl / alt-0", "resize sidebar / reset"],
     ["esc", "back to workspace"],
@@ -2386,7 +2611,8 @@ const PANE_HELP: Record<string, [string, string][]> = {
   "env-list": [
     ["j / k", "move"],
     ["enter", "activate environment"],
-    ["e / i / ctrl-l", "open file for editing"],
+    ["e / l / ctrl-l", "open file for editing"],
+    ["i", "open file and insert"],
     ["ctrl-r", "reveal/mask secrets"],
     ["alt+hl / alt-0", "resize sidebar / reset"],
     ["esc / 1", "back to workspace"],
@@ -2395,7 +2621,9 @@ const PANE_HELP: Record<string, [string, string][]> = {
   "env-editor": [
     ...VIM_MOVE,
     ...VIM_EDIT,
-    ["ctrl-s", "save"],
+    ["ctrl-s / :w", "save"],
+    [":wq / :x", "save and close pane"],
+    [":q / :q!", "close pane (bang discards changes)"],
     ["alt+hl / alt-0", "resize sidebar / reset"],
     ["ctrl-h", "back to list"],
     ["esc", "leave insert / cancel visual / back to list"],
@@ -2432,6 +2660,14 @@ function showHelp() {
 renderer.keyInput.on("keypress", (key: KeyEvent) => {
   const k = key.name;
   if (helpVisible) { hideHelp(); setStatus(); key.preventDefault(); return; }
+  if (commandBuffer !== null) {
+    if (k === "escape") { commandBuffer = null; setStatus(); }
+    else if (k === "return" || k === "enter") { const cmd = commandBuffer; commandBuffer = null; runCommandLine(cmd); setStatus(); }
+    else if (k === "backspace") { commandBuffer = commandBuffer.slice(0, -1); setStatus(); }
+    else if (key.sequence && key.sequence.length === 1 && !key.ctrl && !key.meta && !key.option) { commandBuffer += key.sequence; setStatus(); }
+    key.preventDefault();
+    return;
+  }
   if (k === "?" && !insert && !envInsert && !filterInputFocused()) { showHelp(); key.preventDefault(); return; }
 
   if (!insert && !envInsert && !visual && !pending && !listPending && !filterInputFocused()) {
@@ -2477,18 +2713,33 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
       }
       return;
     }
-    if (k === "q") { renderer.destroy(); process.exit(0); }
+    if (k === "q") {
+      const dirtyName = dirtyBufferName();
+      if (dirtyName) { focusDirtyBuffer(dirtyName); key.preventDefault(); return; }
+      renderer.destroy(); process.exit(0);
+    }
     if (envPane === "editor") {
       if (key.ctrl && k === "s") { saveEnvironmentFile(); key.preventDefault(); return; }
       if (key.ctrl && k === "h") { setEnvPane("list"); key.preventDefault(); return; }
       if (k === "escape") { setEnvPane("list"); key.preventDefault(); return; }
+      if (!visual && (k === ":" || (k === ";" && key.shift))) { enterCommandLine(); key.preventDefault(); return; }
       vimNormal(k, key, envDetail, false, "environment");
       key.preventDefault(); return;
     }
     if (key.ctrl && k === "l") { setEnvPane("editor"); key.preventDefault(); return; }
+    if (k === "l") { setEnvPane("editor"); key.preventDefault(); return; }
+    if (k === ":" || (k === ";" && key.shift)) { enterCommandLine(); key.preventDefault(); return; }
     if (k === "escape" || k === "1") { setWindow("workspace"); key.preventDefault(); return; }
-    if (k === "j") { selectedEnvironment = Math.min(environments.length - 1, selectedEnvironment + 1); renderEnvironments(); loadEnvironmentFile(); key.preventDefault(); return; }
-    if (k === "k") { selectedEnvironment = Math.max(0, selectedEnvironment - 1); renderEnvironments(); loadEnvironmentFile(); key.preventDefault(); return; }
+    if (k === "j") {
+      const next = Math.min(environments.length - 1, selectedEnvironment + 1);
+      if (envDirty() && environments[next] !== envLoadedName) { warnDirty(`.env.${envLoadedName}`); key.preventDefault(); return; }
+      selectedEnvironment = next; renderEnvironments(); loadEnvironmentFile(); key.preventDefault(); return;
+    }
+    if (k === "k") {
+      const next = Math.max(0, selectedEnvironment - 1);
+      if (envDirty() && environments[next] !== envLoadedName) { warnDirty(`.env.${envLoadedName}`); key.preventDefault(); return; }
+      selectedEnvironment = next; renderEnvironments(); loadEnvironmentFile(); key.preventDefault(); return;
+    }
     if (k === "enter" || k === "return") {
       environmentIdx = selectedEnvironment;
       refreshEditorHighlights();
@@ -2503,6 +2754,7 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
     }
     if (k === "i") {
       setEnvPane("editor");
+      enterEnvInsert();
       key.preventDefault(); return;
     }
     if (k === "r" && key.ctrl) { secretsRevealed = !secretsRevealed; renderEnvironments(); loadEnvironmentFile(); key.preventDefault(); return; }
@@ -2517,13 +2769,18 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
       vimNormal(k, key, historyDetail, true);
       key.preventDefault(); return;
     }
-    if (k === "q") { renderer.destroy(); process.exit(0); }
+    if (k === "q") {
+      const dirtyName = dirtyBufferName();
+      if (dirtyName) { focusDirtyBuffer(dirtyName); key.preventDefault(); return; }
+      renderer.destroy(); process.exit(0);
+    }
     if (k === "escape") { setWindow("workspace"); key.preventDefault(); return; }
     if (k === "j") { moveHistory(1); key.preventDefault(); return; }
     if (k === "k") { moveHistory(-1); key.preventDefault(); return; }
     if (key.ctrl && k === "d") { moveHistory(5); key.preventDefault(); return; }
     if (key.ctrl && k === "u") { moveHistory(-5); key.preventDefault(); return; }
     if (key.ctrl && k === "l") { setHistoryPane("detail"); key.preventDefault(); return; }
+    if (k === "l") { setHistoryPane("detail"); key.preventDefault(); return; }
     if (k === "g") { selectedHistory = 0; renderHistory(); key.preventDefault(); return; }
     if (k === "G") { selectedHistory = Math.max(0, historyGroups.length - 1); renderHistory(); key.preventDefault(); return; }
     if (k === "enter" || k === "return") { setHistoryPane("detail"); key.preventDefault(); return; }
@@ -2545,6 +2802,7 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
     }
     if (visual && k === "escape") { clearVisual(); setStatus(); key.preventDefault(); return; }
     if (k === "escape") { setPane("list"); key.preventDefault(); return; }
+    if (!visual && (k === ":" || (k === ";" && key.shift))) { enterCommandLine(); key.preventDefault(); return; }
     if (k === "[") { cycleVariant(-1); key.preventDefault(); return; }
     if (k === "]") { cycleVariant(1); key.preventDefault(); return; }
     vimNormal(k, key);
@@ -2552,7 +2810,11 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
     return;
   }
 
-  if (k === "q" && pane === "list" && !filterInputFocused()) { renderer.destroy(); process.exit(0); }
+  if (k === "q" && pane === "list" && !filterInputFocused()) {
+    const dirtyName = dirtyBufferName();
+    if (dirtyName) { focusDirtyBuffer(dirtyName); key.preventDefault(); return; }
+    renderer.destroy(); process.exit(0);
+  }
   if (k === "l" && key.ctrl) { setPane(pane === "list" ? "editor" : "response"); key.preventDefault(); return; }
   if (k === "h" && key.ctrl) { setPane(pane === "response" ? "editor" : "list"); key.preventDefault(); return; }
   if (visual && k === "escape") { clearVisual(); setStatus(); key.preventDefault(); return; }
@@ -2568,6 +2830,7 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
   if (pane === "list") {
     if (filterInputFocused()) return;
     if (k === "/" ) { filterInput.focus(); key.preventDefault(); return; }
+    if (k === ":" || (k === ";" && key.shift)) { enterCommandLine(); key.preventDefault(); return; }
     if (listPending) {
       const pendingList = listPending;
       listPending = null;
@@ -2608,6 +2871,7 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
     if (k === "[") { cycleVariant(-1); key.preventDefault(); return; }
     if (k === "]") { cycleVariant(1); key.preventDefault(); return; }
     if (k === "n" && key.ctrl) {
+      if (editorDirty() && editorEntry) { warnDirty(editorEntry.reqName); key.preventDefault(); return; }
       const name = `untitled-${Date.now() % 100000}`;
       const file = join(COLLECTION, `${name}.hurl`);
       const template = "# TODO: describe this request\nGET {{host}}/\n";
@@ -2621,6 +2885,7 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
     }
     if (k === "x" && key.ctrl) {
       const r = currentReq();
+      if (r && editorDirty() && editorEntry && r.name === editorEntry.reqName) { warnDirty(editorEntry.reqName); key.preventDefault(); return; }
       if (r) {
         rmSync(r.file);
         requests.splice(requests.indexOf(r), 1);
@@ -2683,7 +2948,15 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
 
 function filterInputFocused() { return (filterInput as any).focused === true; }
 filterInput.on("input" as any, () => refreshList());
-editor.onContentChange = () => refreshEditorHighlights();
+editor.onContentChange = () => {
+  refreshEditorHighlights();
+  syncModeTitles();
+  setStatus();
+};
+envDetail.onContentChange = () => {
+  syncModeTitles();
+  setStatus();
+};
 envDetail.onKeyDown = (key) => {
   if (!envInsert) return;
   if (key.ctrl && key.name === "s") {

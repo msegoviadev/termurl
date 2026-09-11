@@ -106,7 +106,14 @@ Useful controls:
   `{{variables}}` rendered to their active values so you can paste and run
   them in any other terminal.
 - `s`: save the complete response body to `.termurl/bodies/`.
-- `i`: enter INSERT mode in an editor; `ctrl-s`: save the file.
+- `i`: enter INSERT mode in an editor; `ctrl-s` or `:w`: save the file.
+- `:` opens a vim-style command line in the status bar: `:w` saves, `:wq`/`:x`
+  save and close the pane, `:q` closes the pane (or quits from a list), and
+  `!` variants discard unsaved changes. Unsaved buffers show a `[+]` marker in
+  the pane title and a yellow `[<name> +a -d]` badge (added/removed lines) in
+  the status bar, and actions that would discard them (switching requests,
+  variants, environments, or quitting) are blocked with a warning instead; a
+  blocked quit jumps focus straight to the buffer that needs attention.
 - `v` / `]`: next variant; `[`: previous variant (when the request has any).
 - `ctrl-p`: cycle environments.
 - `?`: show shortcuts for the current pane; `q`: quit.
@@ -291,8 +298,8 @@ strip under the request pane listing every variant as a tab. Cycle with `v` /
 `]` (next) and `[` (previous), or click a tab. Switching is instant: the
 editor immediately shows that entry, so you see the headers and body as you
 flip through. The active variant shows on the row as `name@variant`, and
-`ctrl-s` writes your edits back into the right spot in the file. Queued flows
-remember the variant you picked.
+`ctrl-s` (or `:w`) writes your edits back into the right spot in the file.
+Queued flows remember the variant you picked.
 
 In the CLI, append `@variant` to the request name or pass `--variant`:
 
