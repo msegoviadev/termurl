@@ -1917,6 +1917,13 @@ function watchCollection() {
   } catch {}
 }
 
+function applyTextareaColors(target: TextareaRenderable) {
+  target.backgroundColor = C.bg;
+  target.textColor = C.fg;
+  target.focusedBackgroundColor = C.bg;
+  target.focusedTextColor = C.fg;
+}
+
 function applyPalette() {
   Object.assign(C, resolvePalette(CONFIG));
   renderer.setBackgroundColor(C.bg);
@@ -1927,27 +1934,23 @@ function applyPalette() {
   filterInput.textColor = C.fg;
   treeList.backgroundColor = C.bg;
   editorBox.backgroundColor = C.bg;
-  editor.backgroundColor = C.bg;
-  editor.textColor = C.fg;
+  applyTextareaColors(editor);
   variantStrip.backgroundColor = C.panel;
   horizontalDivider.backgroundColor = C.bg;
   responseBox.backgroundColor = C.bg;
-  respView.backgroundColor = C.bg;
-  respView.textColor = C.fg;
+  applyTextareaColors(respView);
   historyWindow.backgroundColor = C.bg;
   historyListBox.backgroundColor = C.bg;
   historyDivider.backgroundColor = C.bg;
   historyList.backgroundColor = C.bg;
   historyDetailBox.backgroundColor = C.bg;
-  historyDetail.backgroundColor = C.bg;
-  historyDetail.textColor = C.fg;
+  applyTextareaColors(historyDetail);
   envWindow.backgroundColor = C.bg;
   envListBox.backgroundColor = C.bg;
   environmentDivider.backgroundColor = C.bg;
   envList.backgroundColor = C.bg;
   envDetailBox.backgroundColor = C.bg;
-  envDetail.backgroundColor = C.bg;
-  envDetail.textColor = C.fg;
+  applyTextareaColors(envDetail);
   helpBackdrop.backgroundColor = C.bg;
   helpOverlay.borderColor = C.yellow;
   helpOverlay.backgroundColor = C.bg;
