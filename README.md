@@ -87,14 +87,15 @@ Changes to `theme` apply on the next launch.
 
 ### TUI workflow
 
-1. Browse requests in the workspace window.
+1. Browse requests in the Requests tab.
 2. Press `enter` to run the selected request.
 3. Press `tab` to queue or unqueue requests.
 4. Press `shift-enter` or `ctrl-f` to run the queued requests in order as one
    Hurl flow.
-5. Use `ctrl-l` and `ctrl-h` to move between the request, editor, and response
+5. Press `2` for the Flows tab to create, edit, and run saved [flows](#flows).
+6. Use `ctrl-l` and `ctrl-h` to move between the request, editor, and response
    panes.
-6. Press `2` for execution history or `3` for environments.
+7. Press `3` for execution history or `4` for environments.
 
 Useful controls:
 
@@ -106,16 +107,23 @@ Useful controls:
   `{{variables}}` rendered to their active values so you can paste and run
   them in any other terminal.
 - `s`: save the complete response body to `.termurl/bodies/`.
+- `a`: create a request/flow or folder (a trailing `/` makes a folder, naming
+  follows the collection-relative path); `r`: rename the selected file/folder;
+  `d`: delete it (asks to confirm). Renaming or deleting a request updates
+  `.flow` references.
+- Running moves focus to the response pane (in Requests and in Flows); `escape`
+  returns to the list and `ctrl-h` to the editor, so the next run is a key away.
 - `i`: enter INSERT mode in an editor; `ctrl-s` or `:w`: save the file.
 - `:` opens a vim-style command line in the status bar: `:w` saves, `:wq`/`:x`
   save and close the pane, `:q` closes the pane (or quits from a list), and
   `!` variants discard unsaved changes. Unsaved buffers show a `[+]` marker in
   the pane title and a yellow `[<name> +a -d]` badge (added/removed lines) in
   the status bar, and actions that would discard them (switching requests,
-  variants, environments, or quitting) are blocked with a warning instead; a
+  variants, environments, flows, or quitting) are blocked with a warning instead; a
   blocked quit jumps focus straight to the buffer that needs attention.
 - `v` / `]`: next variant; `[`: previous variant (when the request has any).
 - `ctrl-p`: cycle environments.
+- `1`: Requests, `2`: Flows, `3`: History, `4`: Environments.
 - `?`: show shortcuts for the current pane; `q`: quit.
 
 Mouse support includes pane focus, cursor positioning, row selection, folder
@@ -221,6 +229,12 @@ Run a single variant of a request (see [Variants](#variants)):
 termurl run specs/get@bad-payload --env dev --json
 ```
 
+Run a saved [flow](#flows) by name:
+
+```bash
+termurl run auth-check --env dev --json
+```
+
 Pass additional variables with repeatable `--var` options:
 
 ```bash
@@ -254,15 +268,16 @@ my-apis/
   .env.dev
   .env.prod
   .env.example         # template, skipped by environment discovery
+  flows/
+    auth-check.flow     # saved ordered group of requests
   specs/
     get.hurl
     list.hurl
 ```
 
 The collection-relative file path becomes the request name. The first `#`
-comment becomes its description. Ordered flows are currently supplied as
-explicit request arguments; a first-class ordered collection format can be
-added later without changing individual request files.
+comment becomes its description. Ordered groups can be run ad hoc as explicit
+arguments, or saved as [flows](#flows) for reuse from the TUI and the CLI.
 
 Environments use `.env.<name>` files. Variables are parsed as simple
 `KEY=value` lines. Keys prefixed with `secret_` are masked in the TUI (toggle
@@ -311,6 +326,68 @@ termurl show anything/post@xml                        # print one entry
 ```
 
 `termurl list --json` exposes each request's variants.
+
+### Flows
+
+A flow is a named, saved, ordered group of requests that runs as one Hurl flow,
+so captures from earlier steps are available to later ones. Flows live under
+`flows/` at the collection root as `.flow` files, one request per line with an
+optional `@variant`, `#` comments ignored, and the first `#` comment used as the
+flow description:
+
+```text
+flows/auth-check.flow
+```
+
+```hurl
+# Log in, then fetch the current user
+auth/login
+users/me
+```
+
+The file path minus `.flow`, with the leading `flows/` dropped, is the flow name
+(`flows/admin/reset.flow` is `admin/reset`). Steps are resolved exactly like
+`termurl run` arguments, so an unknown request or variant is reported before
+anything runs.
+
+Run a flow headlessly, or list and inspect them:
+
+```bash
+termurl flows list --json
+termurl flows show auth-check
+termurl run auth-check --env dev --json
+```
+
+Explicit requests and flows can be mixed in one invocation and run in argument
+order. A name that matches both a request and a flow resolves to the request.
+Flow steps without an explicit `@variant` follow the `--variant` flag, and the
+environment comes from `--env` (CLI) or the active environment (TUI).
+
+The **Flows tab** (`2`) shows a tree of `flows/` folders and saved flows, and
+edits the selected flow directly, with the `.flow` file as the source of truth:
+
+- `j`/`k`, `g`/`G`: move through the tree; the right pane shows the selected file.
+- `enter`/`l`: run the selected flow (the response appears in the right-hand
+  response pane, and focus moves there), or expand/collapse a folder.
+- `a`: create a flow or folder by typing its name inline. A trailing `/` makes
+  a folder, and `/` in the middle nests (`admin/reset`).
+- `r`: rename the selected flow or folder.
+- `d`: delete the selected flow or folder (asks to confirm).
+- `e`/`i`: open the flow editor; `i`: open it in INSERT mode.
+- In the editor: `ctrl-a` appends the request currently selected in the
+  Requests tab as a step, and `:add <request[@variant]>` appends by name.
+- `J`/`K`: move the current step down/up (or use the usual `dd`/`p`).
+- `ctrl-s`/`:w`: save; `:q`/`:q!`: close the editor; `ctrl-f`: run.
+- `ctrl-l`/`ctrl-h`: cycle list, editor, and response panes.
+- `ctrl-g` (or `:flows`) still opens a quick picker from the Requests tab, and
+  `:saveflow <name>` (`:saveflow!` to overwrite) saves the current `tab` queue
+  as a flow.
+
+The **Requests tab** uses the same keys: `a` creates a request or folder, `r`
+renames, and `d` deletes. Names are collection-relative, so `a` with `specs/`
+creates a folder and `specs/get` creates `specs/get.hurl`. Renaming or deleting
+a request rewrites the corresponding step lines in every `.flow` file.
+
 
 ## Development
 

@@ -23,6 +23,8 @@ newer, must be on `PATH`.
 - `termurl env list --json` lists available environments.
 - `termurl env show <name>` displays environment variables. Keys prefixed with
   `secret_` are masked unless `--reveal` is explicitly used.
+- `termurl flows list --json` lists saved flows with their steps and descriptions.
+- `termurl flows show <name>` prints a flow file.
 
 Request names are the collection-relative path without `.hurl`, for example
 `specs/get`. A `.hurl` suffix is also accepted. Run requests explicitly, never
@@ -51,6 +53,12 @@ requests are available to later requests:
 
 ```bash
 termurl run auth/login users/me --env dev
+```
+
+A saved flow runs the same way by name, and can be mixed with explicit requests:
+
+```bash
+termurl run auth-check --env dev --json
 ```
 
 Requests can define variants (alternative headers and body in the same file).

@@ -13,7 +13,7 @@ import {
   type KeyEvent,
 } from "@opentui/core";
 import packageJson from "./package.json" with { type: "json" };
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, readdirSync, statSync, rmSync, watch } from "fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, readdirSync, statSync, rmSync, renameSync, watch } from "fs";
 import { join, relative, resolve, dirname } from "path";
 import { homedir, tmpdir } from "os";
 import * as readline from "node:readline/promises";
@@ -79,7 +79,7 @@ async function runInit(defaultPath: string, nonInteractive = false) {
 }
 
 const args = cliArgs();
-const HEADLESS_COMMANDS = new Set(["doctor", "list", "show", "env", "run"]);
+const HEADLESS_COMMANDS = new Set(["doctor", "list", "show", "env", "run", "flows"]);
 const HELP = `termurl - a terminal client for hurl collections
 
 usage:
@@ -90,7 +90,9 @@ usage:
   termurl show <request[@variant]>             print a request file or a single variant
   termurl env list [--json]                    list environments
   termurl env show <name> [--reveal] [--json]  show environment variables
-  termurl run <request[@variant]...> [options]  run requests in argument order
+  termurl flows list [--json]                  list saved flows
+  termurl flows show <name>                    print a flow file
+  termurl run <target...> [options]            run requests and/or flows in argument order
   termurl --version                            print the version
 
 run options:
@@ -158,6 +160,10 @@ const REQUEST_CAPTURE = new RegExp(`^(${HTTP_METHODS})\\s+(\\S+)`, "m");
 const VARIANT_MARKER = /^#\s*variant:\s*(.+?)\s*$/;
 
 const requests = loadRequests();
+const requestDirs = loadRequestDirs();
+const flowCache = new Map<string, FlowCacheEntry>();
+const flows = loadFlows();
+const flowDirs = loadFlowDirs();
 const environments = environmentNames();
 if (environments.length === 0) environments.push("dev");
 let environmentIdx = Math.max(0, environments.indexOf(CONFIG.environment ?? ""));
@@ -239,6 +245,29 @@ function walk(dir: string): string[] {
   });
 }
 
+// Relative paths of every directory under `dir`, so empty folders are visible in
+// the request tree. Dot-directories (including .termurl) are skipped.
+function walkDirs(dir: string, base = dir, acc: string[] = []): string[] {
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return acc;
+  }
+  for (const entry of entries) {
+    if (entry.startsWith(".")) continue;
+    const path = join(dir, entry);
+    if (!statSync(path).isDirectory()) continue;
+    acc.push(relative(base, path));
+    walkDirs(path, base, acc);
+  }
+  return acc;
+}
+
+function loadRequestDirs(collection = COLLECTION): string[] {
+  return walkDirs(collection).sort((a, b) => a.localeCompare(b));
+}
+
 function loadRequests(collection = COLLECTION): Req[] {
   return walk(collection)
     .map((file) => {
@@ -253,6 +282,86 @@ function loadRequests(collection = COLLECTION): Req[] {
       return { name, file, desc, method, path, vars, variants };
     })
     .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+type Flow = { name: string; file: string; desc: string; steps: string[] };
+
+// A .flow file is a saved ordered group of requests: one `request[@variant]` per
+// line, `#` comment lines ignored, and the first `#` comment becomes the
+// description. Nothing from a flow reaches Hurl directly; the steps are expanded
+// into RunTargets and then run by the same flow engine as `termurl run`.
+function flowFiles(dir: string): string[] {
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return [];
+  }
+  return entries.flatMap((entry) => {
+    const path = join(dir, entry);
+    return statSync(path).isDirectory() ? flowFiles(path) : entry.endsWith(".flow") ? [path] : [];
+  });
+}
+
+function flowName(collection: string, file: string): string {
+  const relativePath = relative(collection, file).replace(/\.flow$/, "");
+  return relativePath.startsWith("flows/") ? relativePath.slice("flows/".length) : relativePath;
+}
+
+function loadFlowDirs(collection = COLLECTION): string[] {
+  return walkDirs(join(collection, "flows")).sort((a, b) => a.localeCompare(b));
+}
+
+function parseFlow(src: string): { desc: string; steps: string[] } {
+  const steps: string[] = [];
+  let desc = "";
+  for (const line of src.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (trimmed === "") continue;
+    if (trimmed.startsWith("#")) {
+      if (!desc) desc = trimmed.replace(/^#\s*/, "");
+      continue;
+    }
+    steps.push(trimmed);
+  }
+  return { desc, steps };
+}
+
+type FlowCacheEntry = { mtimeMs: number; text: string; flow: { desc: string; steps: string[] } };
+
+function readFlowFile(file: string): FlowCacheEntry {
+  try {
+    const mtimeMs = statSync(file).mtimeMs;
+    const cached = flowCache.get(file);
+    if (cached && cached.mtimeMs === mtimeMs) return cached;
+    const text = readFileSync(file, "utf8");
+    const fresh: FlowCacheEntry = { mtimeMs, text, flow: parseFlow(text) };
+    flowCache.set(file, fresh);
+    return fresh;
+  } catch {
+    return { mtimeMs: 0, text: "", flow: { desc: "", steps: [] } };
+  }
+}
+
+function loadFlows(collection = COLLECTION): Flow[] {
+  return flowFiles(join(collection, "flows"))
+    .map((file) => {
+      const { flow } = readFlowFile(file);
+      return { name: flowName(collection, file), file, desc: flow.desc, steps: flow.steps };
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function resolveFlow(flow: Flow): { targets?: RunTarget[]; error?: string } {
+  const targets: RunTarget[] = [];
+  for (const step of flow.steps) {
+    const resolved = resolveTarget(step);
+    if (resolved.error) return { error: `flow ${flow.name}: ${resolved.error}` };
+    if (!resolved.target) return { error: `flow ${flow.name}: unknown request "${step}"` };
+    targets.push(resolved.target);
+  }
+  if (targets.length === 0) return { error: `flow ${flow.name} has no requests` };
+  return { targets };
 }
 
 function section(src: string, name: string): string[] {
@@ -683,6 +792,47 @@ function unknownRequest(input: string): number {
   return 1;
 }
 
+function flowForInput(input: string): Flow | undefined {
+  const withoutExtension = input.replace(/\.flow$/, "");
+  const absolute = resolve(input);
+  const relativeName = COLLECTION ? flowName(COLLECTION, absolute) : "";
+  return flows.find((flow) => flow.name === input || flow.name === withoutExtension || flow.name === relativeName || flow.file === absolute);
+}
+
+// Expands positional CLI inputs into run targets, in order. A name is first
+// matched to a request and, failing that, to a saved flow whose steps are
+// flattened in place, so explicit requests and flows can be mixed in one run.
+function cliTargets(inputs: string[], variantOption: string | undefined): { targets?: RunTarget[]; code?: number } {
+  const targets: RunTarget[] = [];
+  for (const input of inputs) {
+    const resolved = resolveTarget(input);
+    if (resolved.error) {
+      console.error(`termurl: ${resolved.error}`);
+      return { code: 1 };
+    }
+    if (resolved.target) {
+      const variant = resolved.target.variant ?? variantOption;
+      if (variant && !resolved.target.req.variants.includes(variant)) {
+        console.error(`termurl: unknown variant "${variant}" for ${resolved.target.req.name}; available variants: ${resolved.target.req.variants.join(", ") || "none"}`);
+        return { code: 1 };
+      }
+      targets.push({ req: resolved.target.req, variant });
+      continue;
+    }
+    const flow = flowForInput(input);
+    if (!flow) return { code: unknownRequest(input) };
+    const expanded = resolveFlow(flow);
+    if (expanded.error) {
+      console.error(`termurl: ${expanded.error}`);
+      return { code: 1 };
+    }
+    for (const step of expanded.targets ?? []) {
+      targets.push({ req: step.req, variant: step.variant ?? variantOption });
+    }
+  }
+  return { targets };
+}
+
 function listCommand(json: boolean): number {
   const result = requests.map((request) => ({
     name: request.name,
@@ -760,6 +910,39 @@ function envShowCommand(name: string | undefined, reveal: boolean, json: boolean
   return 0;
 }
 
+function flowsListCommand(json: boolean): number {
+  const result = flows.map((flow) => ({
+    name: flow.name,
+    file: flow.file,
+    description: flow.desc,
+    steps: flow.steps,
+  }));
+  if (json) {
+    console.log(JSON.stringify(result, null, 2));
+    return 0;
+  }
+  const width = flows.reduce((max, flow) => Math.max(max, flow.name.length), 0);
+  for (const flow of flows) {
+    console.log(`${flow.name.padEnd(width)}  ${flow.steps.length} steps${flow.desc ? `  - ${flow.desc}` : ""}`);
+  }
+  return 0;
+}
+
+function flowsShowCommand(input: string | undefined): number {
+  if (!input) {
+    console.error("termurl: usage: termurl flows show <name>");
+    return 1;
+  }
+  const flow = flows.find((candidate) => candidate.name === input || candidate.name === input.replace(/\.flow$/, ""));
+  if (!flow) {
+    console.error(`termurl: unknown flow "${input}"`);
+    if (flows.length) console.error(`available flows:\n${flows.map((candidate) => `  ${candidate.name}`).join("\n")}`);
+    return 1;
+  }
+  process.stdout.write(readFileSync(flow.file, "utf8"));
+  return 0;
+}
+
 function doctorCommand(json: boolean): number {
   let hurlVersion: string | undefined;
   try {
@@ -771,13 +954,14 @@ function doctorCommand(json: boolean): number {
   const configuredCollection = CONFIG.collection ? resolve(expandHome(CONFIG.collection)) : undefined;
   const collectionExists = Boolean(configuredCollection && existsSync(configuredCollection) && statSync(configuredCollection).isDirectory());
   const collectionRequests = collectionExists ? loadRequests(configuredCollection as string).length : 0;
+  const collectionFlows = collectionExists ? loadFlows(configuredCollection as string).length : 0;
   const names = collectionExists ? environmentNames(configuredCollection as string) : [];
   const checks = {
     hurl: { ok: Boolean(hurlVersion), detail: hurlVersion ?? "not found on PATH; install hurl v8 or newer" },
     config: { ok: configExists, detail: configExists ? CONFIG_FILE : `missing; run termurl init to create ${CONFIG_FILE}` },
     collection: {
       ok: collectionExists,
-      detail: collectionExists ? `${configuredCollection} (${collectionRequests} requests)` : configuredCollection ? `not found: ${configuredCollection}` : "not configured",
+      detail: collectionExists ? `${configuredCollection} (${collectionRequests} requests, ${collectionFlows} flows)` : configuredCollection ? `not found: ${configuredCollection}` : "not configured",
     },
     environments: { ok: collectionExists, names },
   };
@@ -837,24 +1021,12 @@ async function runCommand(values: string[]): Promise<number> {
   cliVariables = parsed.variables ?? {};
   const inputs = positionalArgs(values);
   if (inputs.length === 0) {
-    console.error("termurl: usage: termurl run <request[@variant]...> [--env name] [--variant name] [--var KEY=value] [--json] [-q]");
+    console.error("termurl: usage: termurl run <target...> [--env name] [--variant name] [--var KEY=value] [--json] [-q]");
     return 1;
   }
-  const targets: RunTarget[] = [];
-  for (const input of inputs) {
-    const resolved = resolveTarget(input);
-    if (resolved.error) {
-      console.error(`termurl: ${resolved.error}`);
-      return 1;
-    }
-    if (!resolved.target) return unknownRequest(input);
-    const variant = resolved.target.variant ?? variantOption;
-    if (variant && !resolved.target.req.variants.includes(variant)) {
-      console.error(`termurl: unknown variant "${variant}" for ${resolved.target.req.name}; available variants: ${resolved.target.req.variants.join(", ") || "none"}`);
-      return 1;
-    }
-    targets.push({ req: resolved.target.req, variant });
-  }
+  const resolvedTargets = cliTargets(inputs, variantOption);
+  if (!resolvedTargets.targets) return resolvedTargets.code ?? 1;
+  const targets = resolvedTargets.targets;
 
   const results = await runHurl(targets);
   const json = values.includes("--json");
@@ -886,6 +1058,14 @@ async function runHeadlessCommand(): Promise<number> {
     if (subcommand === "list") return envListCommand(values.includes("--json"));
     if (subcommand === "show") return envShowCommand(positionalArgs(values)[0], values.includes("--reveal"), values.includes("--json"));
     console.error("termurl: usage: termurl env list [--json] | termurl env show <name> [--reveal] [--json]");
+    return 1;
+  }
+  if (command === "flows") {
+    const subcommand = args[1];
+    const values = args.slice(2);
+    if (subcommand === "list") return flowsListCommand(values.includes("--json"));
+    if (subcommand === "show") return flowsShowCommand(positionalArgs(values)[0]);
+    console.error("termurl: usage: termurl flows list [--json] | termurl flows show <name>");
     return 1;
   }
   if (command === "run") return runCommand(args.slice(1));
@@ -938,10 +1118,25 @@ let statusMsg = "";
 let envInsert = false;
 type EnvPane = "list" | "editor";
 let envPane: EnvPane = "list";
+type FlowPane = "list" | "editor" | "response";
+let flowPane: FlowPane = "list";
+type FlowRow =
+  | { type: "folder"; path: string; name: string; depth: number }
+  | { type: "flow"; flow: Flow; depth: number };
+const flowCollapsed = new Set<string>();
+let flowRows: FlowRow[] = [];
+let selectedFlowRow = 0;
+let flowInsert = false;
+let flowSavedText = "";
+let flowLoadedName: string | null = null;
+type NamePurpose = "create" | "rename";
+let flowNamePurpose: NamePurpose = "create";
+let requestNamePurpose: NamePurpose = "create";
+let pendingDelete: { label: string; confirm: () => void } | null = null;
 type HistoryPane = "list" | "detail";
 let historyPane: HistoryPane = "list";
-type AppWindow = "workspace" | "history" | "environments";
-let appWindow: AppWindow = "workspace";
+type AppWindow = "requests" | "flows" | "history" | "environments";
+let appWindow: AppWindow = "requests";
 
 type HistoryRecord = {
   ts: string;
@@ -1015,6 +1210,8 @@ let sidebarSplit = 33;
 let editorSplit = 55;
 let historySplit = 44;
 let environmentSplit = 32;
+let flowSplit = 36;
+let flowDetailSplit = 55;
 
 const listBox = new BoxRenderable(renderer, {
   width: `${sidebarSplit}%`, flexShrink: 0, border: true, borderStyle: "single", title: " REQUESTS ", flexDirection: "column",
@@ -1030,6 +1227,14 @@ main.add(verticalDivider);
 
 const filterInput = new InputRenderable(renderer, { placeholder: "/ filter", backgroundColor: "transparent", textColor: C.fg });
 listBox.add(filterInput);
+
+const requestNameInput = new InputRenderable(renderer, {
+  placeholder: "name (end with / for a folder)",
+  backgroundColor: "transparent",
+  textColor: C.fg,
+  visible: false,
+});
+listBox.add(requestNameInput);
 
 const treeList = new ScrollBoxRenderable(renderer, {
   flexGrow: 1,
@@ -1200,6 +1405,98 @@ envDetailWrap.add(envDetailGutter);
 envDetailWrap.add(envDetail);
 envDetailBox.add(envDetailWrap);
 envWindow.visible = false;
+
+const flowWindow = new BoxRenderable(renderer, {
+  flexDirection: "row",
+  flexGrow: 1,
+  backgroundColor: C.bg,
+});
+root.add(flowWindow);
+
+const flowListBox = new BoxRenderable(renderer, {
+  width: flowSplit,
+  border: true,
+  borderStyle: "single",
+  title: " FLOWS ",
+  borderColor: C.dim,
+  backgroundColor: C.bg,
+  flexDirection: "column",
+  padding: 1,
+});
+flowWindow.add(flowListBox);
+
+const flowDivider = new BoxRenderable(renderer, {
+  width: 1, flexShrink: 0, backgroundColor: C.bg, selectable: false,
+} as any);
+flowWindow.add(flowDivider);
+
+const flowList = new BoxRenderable(renderer, {
+  flexGrow: 1,
+  flexDirection: "column",
+  backgroundColor: C.bg,
+});
+flowListBox.add(flowList);
+
+const flowNameInput = new InputRenderable(renderer, {
+  placeholder: "new flow name",
+  backgroundColor: "transparent",
+  textColor: C.fg,
+  visible: false,
+});
+flowListBox.add(flowNameInput);
+
+const flowRightCol = new BoxRenderable(renderer, { flexDirection: "column", flexGrow: 1, flexBasis: 0 });
+flowWindow.add(flowRightCol);
+
+const flowDetailBox = new BoxRenderable(renderer, {
+  height: `${flowDetailSplit}%`,
+  border: true,
+  borderStyle: "single",
+  title: " FLOW ",
+  borderColor: C.dim,
+  backgroundColor: C.bg,
+  padding: 1,
+});
+flowRightCol.add(flowDetailBox);
+
+const flowDetail = new TextareaRenderable(renderer, {
+  backgroundColor: C.bg,
+  textColor: C.fg,
+  flexGrow: 1, flexBasis: 0, height: "100%",
+  selectable: true,
+});
+const flowDetailGutter = new TextRenderable(renderer, {
+  content: "", width: 3, height: "100%", flexShrink: 0, fg: C.dim, bg: C.bg, selectable: false,
+} as any);
+const flowDetailWrap = new BoxRenderable(renderer, { flexDirection: "row", width: "100%", flexGrow: 1, flexBasis: 0 });
+flowDetailWrap.add(flowDetailGutter);
+flowDetailWrap.add(flowDetail);
+flowDetailBox.add(flowDetailWrap);
+
+const flowHorizontalDivider = new BoxRenderable(renderer, {
+  height: 1, flexShrink: 0, backgroundColor: C.bg, selectable: false,
+} as any);
+flowRightCol.add(flowHorizontalDivider);
+
+const flowResponseBox = new BoxRenderable(renderer, {
+  flexGrow: 1, border: true, borderStyle: "single", title: " RESPONSE ", borderColor: C.dim, backgroundColor: C.bg,
+  padding: 1,
+});
+flowRightCol.add(flowResponseBox);
+
+const flowRespView = new TextareaRenderable(renderer, {
+  backgroundColor: C.bg,
+  textColor: C.fg,
+  width: "100%", height: "100%",
+  selectable: true,
+  flexGrow: 1,
+});
+flowRespView.setText("run a flow with enter");
+flowRespView.onKeyDown = (key) => key.preventDefault();
+flowRespView.onPaste = (event) => event.preventDefault();
+flowResponseBox.add(flowRespView);
+
+flowWindow.visible = false;
 root.add(statusBar);
 
 const commandLines: { box: BoxRenderable; line: TextRenderable }[] = [];
@@ -1217,10 +1514,12 @@ function createCommandLine(box: BoxRenderable): { box: BoxRenderable; line: Text
 
 const editorCommandLine = createCommandLine(editorBox);
 const envDetailCommandLine = createCommandLine(envDetailBox);
+const flowDetailCommandLine = createCommandLine(flowDetailBox);
 
 function commandLineTarget(): { box: BoxRenderable; line: TextRenderable } | null {
   if (appWindow === "environments") return envPane === "editor" ? envDetailCommandLine : null;
-  if (appWindow === "workspace" && pane === "editor") return editorCommandLine;
+  if (appWindow === "flows") return flowInsert ? null : flowDetailCommandLine;
+  if (appWindow === "requests" && pane === "editor") return editorCommandLine;
   return null;
 }
 
@@ -1256,13 +1555,68 @@ helpText.onKeyDown = (key) => key.preventDefault();
 helpText.onPaste = (event) => event.preventDefault();
 helpOverlay.add(helpText);
 
-listBox.onMouseDown = () => { if (appWindow === "workspace" && pane !== "list") setPane("list"); };
-editorBox.onMouseDown = () => { if (appWindow === "workspace" && pane !== "editor") setPane("editor"); };
-responseBox.onMouseDown = () => { if (appWindow === "workspace" && pane !== "response") setPane("response"); };
+const flowPickerBackdrop = new BoxRenderable(renderer, {
+  position: "absolute", top: 0, left: 0, width: "100%", height: "100%",
+  backgroundColor: C.bg, zIndex: 99, visible: false,
+});
+root.add(flowPickerBackdrop);
+
+const flowPicker = new BoxRenderable(renderer, {
+  position: "absolute", top: "20%", left: "20%", width: "60%", height: "50%",
+  border: true, borderStyle: "single", title: " FLOWS ",
+  borderColor: C.yellow, backgroundColor: C.bg, zIndex: 100, visible: false,
+  padding: 1,
+});
+root.add(flowPicker);
+
+const flowPickerText = new TextRenderable(renderer, {
+  content: "", width: "100%", height: "100%", fg: C.fg, bg: C.bg, selectable: false,
+} as any);
+flowPicker.add(flowPickerText);
+
+let flowPickerVisible = false;
+let flowPickerIndex = 0;
+
+function renderFlowPicker() {
+  if (!flowPickerVisible) return;
+  if (flows.length === 0) {
+    flowPickerText.content = "no flows yet\n\nqueue requests with tab, then :saveflow <name>";
+    return;
+  }
+  flowPickerIndex = Math.max(0, Math.min(flowPickerIndex, flows.length - 1));
+  flowPickerText.content = flows.map((flow, index) => {
+    const marker = index === flowPickerIndex ? ">" : " ";
+    return `${marker} ${flow.name}  (${flow.steps.length} steps)${flow.desc ? `  - ${flow.desc}` : ""}`;
+  }).join("\n");
+}
+
+function showFlowPicker() {
+  flows.splice(0, flows.length, ...loadFlows());
+  pendingDelete = null;
+  flowPickerVisible = true;
+  flowPickerIndex = 0;
+  flowPicker.title = ` FLOWS (${flows.length}) `;
+  renderFlowPicker();
+  flowPickerBackdrop.visible = true;
+  flowPicker.visible = true;
+}
+
+function hideFlowPicker() {
+  flowPickerVisible = false;
+  flowPickerBackdrop.visible = false;
+  flowPicker.visible = false;
+}
+
+listBox.onMouseDown = () => { if (appWindow === "requests" && pane !== "list") setPane("list"); };
+editorBox.onMouseDown = () => { if (appWindow === "requests" && pane !== "editor") setPane("editor"); };
+responseBox.onMouseDown = () => { if (appWindow === "requests" && pane !== "response") setPane("response"); };
 historyListBox.onMouseDown = () => { if (appWindow === "history" && historyPane !== "list") setHistoryPane("list"); };
 historyDetailBox.onMouseDown = () => { if (appWindow === "history" && historyPane !== "detail") setHistoryPane("detail"); };
 envListBox.onMouseDown = () => { if (appWindow === "environments" && envPane !== "list") setEnvPane("list"); };
 envDetailBox.onMouseDown = () => { if (appWindow === "environments" && envPane !== "editor") setEnvPane("editor"); };
+flowListBox.onMouseDown = () => { if (appWindow === "flows" && flowPane !== "list") setFlowPane("list"); };
+flowDetailBox.onMouseDown = () => { if (appWindow === "flows" && flowPane !== "editor") setFlowPane("editor"); };
+flowResponseBox.onMouseDown = () => { if (appWindow === "flows" && flowPane !== "response") setFlowPane("response"); };
 
 function setSplits(sidebar: number, editor: number) {
   sidebarSplit = Math.max(15, Math.min(60, sidebar));
@@ -1274,12 +1628,20 @@ function setSplits(sidebar: number, editor: number) {
   renderer.requestRender();
 }
 
+function setFlowDetailSplit(value: number) {
+  flowDetailSplit = Math.max(20, Math.min(80, value));
+  const contentHeight = Math.max(1, flowRightCol.height - flowHorizontalDivider.height);
+  flowDetailBox.height = Math.round(contentHeight * flowDetailSplit / 100);
+  renderer.requestRender();
+}
+
 function setFixedSidebarSplit(value: number, container: BoxRenderable, sidebar: BoxRenderable) {
   const max = Math.max(20, container.width - 20);
   const width = Math.max(20, Math.min(max, value));
   sidebar.width = width;
   if (sidebar === historyListBox) historySplit = width;
   else if (sidebar === envListBox) environmentSplit = width;
+  else if (sidebar === flowListBox) flowSplit = width;
   renderer.requestRender();
 }
 
@@ -1314,11 +1676,25 @@ horizontalDivider.onMouseDrag = (event) => {
 };
 horizontalDivider.onMouseDragEnd = () => hideDivider(horizontalDivider);
 
+flowHorizontalDivider.onMouseOver = () => showDivider(flowHorizontalDivider);
+flowHorizontalDivider.onMouseOut = () => hideDivider(flowHorizontalDivider);
+flowHorizontalDivider.onMouseDrag = (event) => {
+  if (event.button !== 0) return;
+  showDivider(flowHorizontalDivider);
+  const height = Math.max(1, flowRightCol.height - flowHorizontalDivider.height);
+  setFlowDetailSplit(((event.y - flowRightCol.screenY) / height) * 100);
+  event.preventDefault();
+};
+flowHorizontalDivider.onMouseDragEnd = () => hideDivider(flowHorizontalDivider);
+
 setupVerticalDivider(historyDivider, historyWindow, (width) => {
   setFixedSidebarSplit(width, historyWindow, historyListBox);
 });
 setupVerticalDivider(environmentDivider, envWindow, (width) => {
   setFixedSidebarSplit(width, envWindow, envListBox);
+});
+setupVerticalDivider(flowDivider, flowWindow, (width) => {
+  setFixedSidebarSplit(width, flowWindow, flowListBox);
 });
 
 function currentReq(): Req | null {
@@ -1354,6 +1730,7 @@ function dirtyBufferInfos(): { name: string; added: number; removed: number }[] 
   const infos: { name: string; added: number; removed: number }[] = [];
   if (editorDirty() && editorEntry) infos.push({ name: editorEntry.reqName, ...diffStats(editorSavedText, editor.plainText) });
   if (envDirty()) infos.push({ name: `.env.${envLoadedName}`, ...diffStats(envSavedText, envDetail.plainText) });
+  if (flowDirty()) infos.push({ name: `flows/${flowLoadedName}`, ...diffStats(flowSavedText, flowDetail.plainText) });
   return infos;
 }
 
@@ -1385,8 +1762,13 @@ function focusDirtyBuffer(name: string) {
       renderEnvironments();
       setEnvPane("editor");
     }
+  } else if (name.startsWith("flows/")) {
+    const flowName = name.slice("flows/".length);
+    setWindow("flows");
+    selectFlowByName(flowName);
+    if (flows.some((flow) => flow.name === flowName)) setFlowPane("editor");
   } else {
-    setWindow("workspace");
+    setWindow("requests");
     const idx = treeRows.findIndex((row) => row.type === "request" && row.req.name === name);
     if (idx >= 0) {
       selectedRow = idx;
@@ -1599,11 +1981,41 @@ function applyResponseHighlights(target: TextareaRenderable, text: string, faile
 }
 
 let lastResponse: { text: string; failed: boolean } | null = null;
+let lastFlowResponse: { text: string; failed: boolean } | null = null;
 
 function renderResponse(text: string, failed: boolean) {
   lastResponse = { text, failed };
   respView.setText(text);
   applyResponseHighlights(respView, text, failed);
+}
+
+function renderFlowResponse(text: string, failed: boolean) {
+  lastFlowResponse = { text, failed };
+  flowRespView.setText(text);
+  applyResponseHighlights(flowRespView, text, failed);
+}
+
+type RunSurface = "requests" | "flows";
+
+function focusResponse(surface: RunSurface) {
+  if (surface === "flows") setFlowPane("response");
+  else setPane("response");
+}
+
+function saveLastBodies(): string {
+  if (lastBodies.size === 0) return "no body to save, run a request first";
+  const dir = join(COLLECTION, ".termurl", "bodies");
+  mkdirSync(dir, { recursive: true });
+  const stamp = Date.now();
+  const saved: string[] = [];
+  for (const [name, body] of lastBodies) {
+    const trimmed = body.trim();
+    const ext = trimmed.startsWith("{") || trimmed.startsWith("[") ? "json" : "txt";
+    const file = join(dir, `${stamp}-${name.replaceAll("/", "-")}.${ext}`);
+    writeFileSync(file, body);
+    saved.push(file);
+  }
+  return saved.length === 1 ? `body saved: ${saved[0]}` : `${saved.length} bodies saved to ${dir}`;
 }
 
 function captureNames(req: Req, variant?: string): string[] {
@@ -1633,7 +2045,7 @@ function variableSource(name: string, captures: Set<string>): VariableSource {
 
 function renderTabs() {
   const tab = (key: string, label: string, active: boolean) => active ? `[${key} ${label}]` : ` ${key} ${label} `;
-  tabBar.content = ` ${tab("1", "Workspace", appWindow === "workspace")} ${tab("2", "History", appWindow === "history")} ${tab("3", "Environments", appWindow === "environments")}    env: ${environments[environmentIdx]}`;
+  tabBar.content = ` ${tab("1", "Requests", appWindow === "requests")} ${tab("2", "Flows", appWindow === "flows")} ${tab("3", "History", appWindow === "history")} ${tab("4", "Environments", appWindow === "environments")}    env: ${environments[environmentIdx]}`;
 }
 
 function envTitle(state: "list" | "editor" | "insert" | "visual"): string {
@@ -1736,6 +2148,7 @@ function setEnvPane(next: EnvPane) {
   clearVisual();
   pending = null;
   commandBuffer = null;
+  pendingDelete = null;
   envInsert = false;
   envPane = next;
   refreshPaneBorders();
@@ -1743,6 +2156,384 @@ function setEnvPane(next: EnvPane) {
   envDetailBox.title = envTitle(next);
   if (next === "editor") envDetail.focus();
   else envDetail.blur();
+  setStatus();
+}
+
+function flowDirty(): boolean {
+  return flowLoadedName !== null && flowDetail.plainText !== flowSavedText;
+}
+
+function currentFlowRow(): FlowRow | null {
+  return flowRows[selectedFlowRow] ?? null;
+}
+
+function currentFlow(): Flow | null {
+  const row = currentFlowRow();
+  return row?.type === "flow" ? row.flow : null;
+}
+
+function flowTitle(state: "list" | "editor" | "insert" | "visual"): string {
+  const flow = currentFlow();
+  const base = flow ? `FLOW (${flow.name})` : "FLOW";
+  const dirty = flowDirty() ? " [+]" : "";
+  if (state === "insert") return ` ${base}${dirty} · INSERT `;
+  if (state === "visual") return ` ${base}${dirty} · VISUAL `;
+  return ` ${base}${dirty} `;
+}
+
+function flowLabel(flow: Flow): string {
+  const name = flow.name.split("/").pop() ?? flow.name;
+  return `${name}  (${flow.steps.length} steps)${flow.desc ? `  - ${flow.desc}` : ""}`;
+}
+
+// Builds the folder/flow rows for the Flows tab from flowDirs + flows. Directories
+// without flows still appear, so `a`/`r`/`d` can act on them.
+function buildFlowTree(): FlowRow[] {
+  type Node = { folders: Map<string, Node>; flows: Flow[] };
+  const root: Node = { folders: new Map(), flows: [] };
+  const ensure = (parts: string[]): Node => {
+    let node = root;
+    for (const part of parts) {
+      let child = node.folders.get(part);
+      if (!child) { child = { folders: new Map(), flows: [] }; node.folders.set(part, child); }
+      node = child;
+    }
+    return node;
+  };
+  for (const dir of flowDirs) ensure(dir.split("/"));
+  for (const flow of flows) ensure(flow.name.split("/").slice(0, -1)).flows.push(flow);
+  const rows: FlowRow[] = [];
+  const walk = (node: Node, path: string, depth: number) => {
+    for (const [name, child] of [...node.folders.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+      const childPath = path ? `${path}/${name}` : name;
+      rows.push({ type: "folder", path: childPath, name, depth });
+      if (!flowCollapsed.has(childPath)) walk(child, childPath, depth + 1);
+    }
+    for (const flow of [...node.flows].sort((a, b) => a.name.localeCompare(b.name))) {
+      rows.push({ type: "flow", flow, depth });
+    }
+  };
+  walk(root, "", 0);
+  return rows;
+}
+
+function renderFlowList() {
+  flowRows = buildFlowTree();
+  selectedFlowRow = Math.max(0, Math.min(selectedFlowRow, Math.max(0, flowRows.length - 1)));
+  clearChildren(flowList);
+  if (flowRows.length === 0) {
+    flowList.add(new TextRenderable(renderer, {
+      content: " no flows yet, press a to create one",
+      width: "100%", height: 1, fg: C.dim, bg: C.bg, truncate: true, selectable: false,
+    }));
+    return;
+  }
+  flowRows.forEach((row, index) => {
+    const selected = index === selectedFlowRow;
+    const content = row.type === "folder"
+      ? `${"  ".repeat(row.depth)}${flowCollapsed.has(row.path) ? "▸" : "▾"} ${row.name}/`
+      : `${"  ".repeat(row.depth + 1)}${flowLabel(row.flow)}`;
+    const rowRenderable = new TextRenderable(renderer, {
+      content,
+      width: "100%",
+      height: 1,
+      fg: row.type === "folder" ? C.cyan : selected ? C.fg : C.dim,
+      bg: selected ? C.selected : C.bg,
+      truncate: true,
+      selectable: false,
+    });
+    rowRenderable.onMouseDown = () => {
+      if (appWindow === "flows" && flowPane !== "list") setFlowPane("list");
+      if (!selectFlowRow(index)) return;
+      if (row.type === "folder") { toggleFlowFolder(row.path); return; }
+      renderFlowList();
+      loadFlowFile();
+    };
+    flowList.add(rowRenderable);
+  });
+}
+
+// Returns false when a dirty flow buffer would be clobbered by the switch.
+function selectFlowRow(index: number): boolean {
+  const row = flowRows[index];
+  if (!row) return false;
+  if (flowDirty() && flowLoadedName !== null) {
+    const targetName = row.type === "flow" ? row.flow.name : null;
+    if (targetName !== flowLoadedName) {
+      warnDirty(`flows/${flowLoadedName}`);
+      return false;
+    }
+  }
+  selectedFlowRow = index;
+  return true;
+}
+
+function moveFlowSelection(delta: number) {
+  if (flowRows.length === 0) return;
+  const next = Math.max(0, Math.min(flowRows.length - 1, selectedFlowRow + delta));
+  if (next === selectedFlowRow) return;
+  if (!selectFlowRow(next)) return;
+  renderFlowList();
+  loadFlowFile();
+}
+
+function toggleFlowFolder(path: string) {
+  flowCollapsed.has(path) ? flowCollapsed.delete(path) : flowCollapsed.add(path);
+  flowRows = buildFlowTree();
+  const index = flowRows.findIndex((row) => row.type === "folder" && row.path === path);
+  if (index >= 0) selectedFlowRow = index;
+  renderFlowList();
+  loadFlowFile();
+}
+
+function loadFlowFile(force = false) {
+  const flow = currentFlow();
+  if (flow) {
+    if (!force && flowDirty() && flowLoadedName === flow.name) {
+      syncModeTitles();
+      return;
+    }
+    let text = "";
+    try { text = readFileSync(flow.file, "utf8"); } catch {}
+    flowLoadedName = flow.name;
+    flowSavedText = text;
+    flowDetail.setText(text);
+  } else {
+    if (!force && flowDirty()) { syncModeTitles(); return; }
+    flowLoadedName = null;
+    flowSavedText = "";
+    flowDetail.setText("");
+  }
+  syncModeTitles();
+}
+
+function saveFlowFile() {
+  const flow = currentFlow();
+  if (!flow) return;
+  const name = flow.name;
+  writeFileSync(flow.file, flowDetail.plainText);
+  flowSavedText = flowDetail.plainText;
+  reloadFlows();
+  selectFlowByName(name);
+  syncModeTitles();
+  statusMsg = `saved flows/${name}`;
+  refreshEditorHighlights();
+  setStatus();
+  setTimeout(() => { statusMsg = ""; setStatus(); }, 2000);
+}
+
+function enterFlowInsert() {
+  flowInsert = true;
+  syncModeTitles();
+  flowDetail.focus();
+  setStatus();
+}
+
+function leaveFlowInsert() {
+  flowInsert = false;
+  flowPane = "editor";
+  syncModeTitles();
+  flowDetail.focus();
+  setStatus();
+}
+
+function setFlowPane(next: FlowPane) {
+  clearVisual();
+  pending = null;
+  commandBuffer = null;
+  pendingDelete = null;
+  flowInsert = false;
+  flowPane = next;
+  refreshPaneBorders();
+  loadFlowFile();
+  flowDetailBox.title = flowTitle(next === "response" ? "list" : next);
+  if (next === "editor") { flowDetail.focus(); flowRespView.blur(); }
+  else if (next === "response") { flowRespView.focus(); flowDetail.blur(); }
+  else { flowDetail.blur(); flowRespView.blur(); }
+  setStatus();
+}
+
+// Parses a name typed in a create/rename input. A trailing "/" means a
+// directory; otherwise a file, with the given extension stripped if present.
+function parseNameInput(value: string, extension: string): { kind: "dir" | "file"; path: string } | { error: string } {
+  let raw = value.trim();
+  if (raw === "") return { error: "name is required" };
+  const kind = raw.endsWith("/") ? "dir" : "file";
+  if (kind === "dir") raw = raw.replace(/\/+$/, "");
+  else if (extension && raw.toLowerCase().endsWith(extension)) raw = raw.slice(0, -extension.length);
+  if (!raw) return { error: "name is required" };
+  if (raw.startsWith("/") || raw.startsWith("~")) return { error: "name must be relative to the collection" };
+  const parts = raw.split("/");
+  if (parts.some((part) => part === "" || part === "." || part === "..")) return { error: `invalid name "${value}"` };
+  return { kind, path: raw };
+}
+
+function flowBase(): string {
+  return join(COLLECTION, "flows");
+}
+
+function reloadFlows() {
+  flowCache.clear();
+  flowDirs.splice(0, flowDirs.length, ...loadFlowDirs());
+  flows.splice(0, flows.length, ...loadFlows());
+  flowRows = buildFlowTree();
+  selectedFlowRow = Math.max(0, Math.min(selectedFlowRow, Math.max(0, flowRows.length - 1)));
+}
+
+function selectFlowByName(name: string, folderPath?: string) {
+  flowRows = buildFlowTree();
+  const index = flowRows.findIndex((row) => row.type === "flow" ? row.flow.name === name : row.type === "folder" && row.path === folderPath);
+  if (index >= 0) selectedFlowRow = index;
+  renderFlowList();
+}
+
+function createFlowPath(value: string): boolean {
+  const parsed = parseNameInput(value, ".flow");
+  if ("error" in parsed) { statusMsg = parsed.error; setStatus(); return false; }
+  const base = flowBase();
+  if (parsed.kind === "dir") {
+    if (existsSync(join(base, parsed.path))) { statusMsg = `flows/${parsed.path}/ already exists`; setStatus(); return false; }
+    mkdirSync(join(base, parsed.path), { recursive: true });
+    reloadFlows();
+    selectFlowByName("", parsed.path);
+    statusMsg = `created flows/${parsed.path}/`;
+    setStatus();
+    return true;
+  }
+  const file = join(base, `${parsed.path}.flow`);
+  if (existsSync(file)) { statusMsg = `flow ${parsed.path} already exists`; setStatus(); return false; }
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, `# ${parsed.path}\n`);
+  reloadFlows();
+  selectFlowByName(parsed.path);
+  setFlowPane("editor");
+  enterFlowInsert();
+  statusMsg = `created flows/${parsed.path}`;
+  setStatus();
+  return true;
+}
+
+function renameFlowPath(value: string): boolean {
+  const row = currentFlowRow();
+  if (!row) return false;
+  if (flowDirty()) { warnDirty(`flows/${flowLoadedName}`); return false; }
+  const parsed = parseNameInput(value, ".flow");
+  if ("error" in parsed) { statusMsg = parsed.error; setStatus(); return false; }
+  const base = flowBase();
+  if (row.type === "folder") {
+    if (parsed.path === row.path) return false;
+    const target = join(base, parsed.path);
+    if (existsSync(target)) { statusMsg = `flows/${parsed.path}/ already exists`; setStatus(); return false; }
+    mkdirSync(dirname(target), { recursive: true });
+    renameSync(join(base, row.path), target);
+    reloadFlows();
+    selectFlowByName("", parsed.path);
+    statusMsg = `renamed flows/${row.path}/ to flows/${parsed.path}/`;
+    setStatus();
+    return true;
+  }
+  if (parsed.path === row.flow.name) return false;
+  const target = join(base, `${parsed.path}.flow`);
+  if (existsSync(target)) { statusMsg = `flow ${parsed.path} already exists`; setStatus(); return false; }
+  mkdirSync(dirname(target), { recursive: true });
+  renameSync(row.flow.file, target);
+  reloadFlows();
+  selectFlowByName(parsed.path);
+  statusMsg = `renamed flows/${row.flow.name} to flows/${parsed.path}`;
+  setStatus();
+  return true;
+}
+
+function deleteFlowPath() {
+  const row = currentFlowRow();
+  if (!row) return;
+  if (flowDirty() && flowLoadedName !== null && (row.type === "flow" ? row.flow.name === flowLoadedName : flowLoadedName.startsWith(`${row.path}/`))) {
+    warnDirty(`flows/${flowLoadedName}`);
+    return;
+  }
+  const label = row.type === "folder" ? `flows/${row.path}/` : `flows/${row.flow.name}`;
+  if (row.type === "folder") rmSync(join(flowBase(), row.path), { recursive: true, force: true });
+  else rmSync(row.flow.file, { force: true });
+  reloadFlows();
+  renderFlowList();
+  loadFlowFile(true);
+  statusMsg = `deleted ${label}`;
+  setStatus();
+}
+
+function showFlowNameInput(purpose: NamePurpose, prefill = "") {
+  flowPane = "list";
+  pendingDelete = null;
+  flowNamePurpose = purpose;
+  flowNameInput.value = prefill;
+  flowNameInput.visible = true;
+  flowNameInput.focus();
+  setStatus();
+}
+
+function hideFlowNameInput() {
+  flowNameInput.visible = false;
+  flowNameInput.blur();
+  setStatus();
+}
+
+function flowNameInputFocused(): boolean {
+  return (flowNameInput as any).focused === true;
+}
+
+function submitFlowName(value: string) {
+  return flowNamePurpose === "rename" ? renameFlowPath(value) : createFlowPath(value);
+}
+
+// Prefill for `a` in the Flows tab: inside the selected folder, or the selected
+// flow's parent directory, so the new file is a sibling.
+function flowCreatePrefill(): string {
+  const row = currentFlowRow();
+  if (!row) return "";
+  if (row.type === "folder") return `${row.path}/`;
+  const at = row.flow.name.lastIndexOf("/");
+  return at > 0 ? row.flow.name.slice(0, at + 1) : "";
+}
+
+function showFlowRenameInput() {
+  const row = currentFlowRow();
+  if (!row) return;
+  showFlowNameInput("rename", row.type === "folder" ? row.path : row.flow.name);
+}
+
+// Appends a request (the explicit argument or the requests selection) as a new
+// step at the end of the flow buffer.
+function appendStepToFlow(target?: string) {
+  if (!currentFlow()) {
+    statusMsg = "select a flow first (tab 2)";
+    setStatus();
+    return;
+  }
+  const req = currentReq();
+  const value = target ?? (req ? targetKey(req, currentVariant(req)) : undefined);
+  if (!value) {
+    statusMsg = "no request selected to add";
+    setStatus();
+    return;
+  }
+  const text = flowDetail.plainText.replace(/\n+$/, "");
+  flowDetail.setText(`${text}\n${value}\n`);
+  flowDetail.focus();
+  statusMsg = `added ${value}`;
+  setStatus();
+}
+
+function moveFlowLine(delta: number) {
+  const eb = flowDetail.editBuffer;
+  const { row } = eb.getCursorPosition();
+  const targetRow = row + delta;
+  if (targetRow < 0 || targetRow >= eb.getLineCount()) return;
+  const text = flowDetail.plainText.split("\n");
+  const [line] = text.splice(row, 1);
+  text.splice(targetRow, 0, line);
+  flowDetail.setText(text.join("\n"));
+  eb.setCursor(targetRow, 0);
+  ensureCursorVisible(flowDetail);
   setStatus();
 }
 
@@ -1988,12 +2779,28 @@ function toggleFlowRequest(req: Req) {
   normalizeFlowQueue();
 }
 
-function buildTree(list: Req[]): TreeNode {
+// Writes the current queue, in order, as a .flow file under flows/. The name is
+// sanitized to keep it inside the flows directory; refuses to overwrite unless
+// force is set.
+function saveCurrentQueue(name: string, force: boolean): string {
+  const trimmed = name.trim().replace(/\.flow$/, "");
+  if (!trimmed) return "usage: :saveflow[!] <name>";
+  if (trimmed.includes("..") || trimmed.startsWith("/") || trimmed.endsWith("/")) return `invalid flow name "${name}"`;
+  const keys = [...flowQueue.entries()].sort(([, a], [, b]) => a - b).map(([key]) => key);
+  if (keys.length === 0) return "queue is empty, mark requests with tab first";
+  const file = join(COLLECTION, "flows", `${trimmed}.flow`);
+  if (existsSync(file) && !force) return `flow ${trimmed} already exists (:saveflow! to overwrite)`;
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, `# Saved from queue\n${keys.join("\n")}\n`);
+  flows.splice(0, flows.length, ...loadFlows());
+  return `saved flow ${trimmed} (${keys.length} steps)`;
+}
+
+function buildTree(list: Req[], dirs: string[]): TreeNode {
   const root: TreeNode = { folders: new Map(), requests: [] };
-  for (const req of list) {
-    const parts = req.name.split("/");
+  const ensure = (parts: string[]): TreeNode => {
     let node = root;
-    for (const part of parts.slice(0, -1)) {
+    for (const part of parts) {
       let child = node.folders.get(part);
       if (!child) {
         child = { folders: new Map(), requests: [] };
@@ -2001,8 +2808,10 @@ function buildTree(list: Req[]): TreeNode {
       }
       node = child;
     }
-    node.requests.push(req);
-  }
+    return node;
+  };
+  for (const dir of dirs) ensure(dir.split("/"));
+  for (const req of list) ensure(req.name.split("/").slice(0, -1)).requests.push(req);
   return root;
 }
 
@@ -2044,7 +2853,7 @@ function renderTree() {
       selectable: false,
     });
     rowRenderable.onMouseDown = () => {
-      if (appWindow === "workspace" && pane !== "list") setPane("list");
+      if (appWindow === "requests" && pane !== "list") setPane("list");
       const now = Date.now();
       const doubleClick = lastRowClick.index === index && now - lastRowClick.time < 400;
       lastRowClick = { index, time: now };
@@ -2075,7 +2884,16 @@ function refreshList(keepName?: string, touchEditor = true) {
   const previous = currentReq()?.name;
   const q = filterInput.value.toLowerCase();
   const filtered = requests.filter((r) => r.name.toLowerCase().includes(q));
-  treeRows = flattenTree(buildTree(filtered));
+  let dirs = requestDirs;
+  if (q) {
+    const needed = new Set<string>();
+    for (const req of filtered) {
+      const parts = req.name.split("/");
+      for (let i = 1; i < parts.length; i++) needed.add(parts.slice(0, i).join("/"));
+    }
+    dirs = requestDirs.filter((dir) => needed.has(dir));
+  }
+  treeRows = flattenTree(buildTree(filtered, dirs));
   const targetName = keepName ?? previous;
   if (targetName) {
     const idx = treeRows.findIndex((row) => row.type === "request" && row.req.name === targetName);
@@ -2087,6 +2905,255 @@ function refreshList(keepName?: string, touchEditor = true) {
   renderTree();
 }
 
+function currentTreeRow(): TreeRow | null {
+  return treeRows[selectedRow] ?? null;
+}
+
+function reloadRequests() {
+  hurlFileCache.clear();
+  requestDirs.splice(0, requestDirs.length, ...loadRequestDirs());
+  requests.splice(0, requests.length, ...loadRequests());
+}
+
+function selectRequestByName(name: string, folderPath?: string) {
+  refreshList();
+  const index = treeRows.findIndex((row) => row.type === "request" ? row.req.name === name : row.type === "folder" && row.path === folderPath);
+  if (index >= 0) selectedRow = index;
+  renderTree();
+}
+
+// Rewrites or drops request step lines inside a flow's raw text, preserving
+// comments, blank lines, indentation, and any @variant suffix.
+function transformFlowText(text: string, rename: Map<string, string>, remove: Set<string>): { text: string; changed: boolean } {
+  const next: string[] = [];
+  let changed = false;
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed === "" || trimmed.startsWith("#")) { next.push(line); continue; }
+    const at = trimmed.lastIndexOf("@");
+    const base = (at > 0 ? trimmed.slice(0, at) : trimmed).replace(/\.hurl$/, "");
+    if (remove.has(base)) { changed = true; continue; }
+    const mapped = rename.get(base);
+    if (mapped !== undefined) {
+      const variant = at > 0 ? trimmed.slice(at) : "";
+      const indent = line.slice(0, line.length - line.trimStart().length);
+      next.push(`${indent}${mapped}${variant}`);
+      changed = true;
+    } else {
+      next.push(line);
+    }
+  }
+  if (!changed) return { text, changed: false };
+  return { text: `${next.join("\n").replace(/\n+$/, "")}\n`, changed: true };
+}
+
+// Applies a request rename/delete to every .flow file (and to a loaded dirty
+// flow buffer), then reloads the flow list.
+function applyFlowReferenceChange(rename: Map<string, string>, remove: Set<string>) {
+  if (rename.size === 0 && remove.size === 0) return;
+  for (const flow of flows) {
+    let src = "";
+    try { src = readFileSync(flow.file, "utf8"); } catch { continue; }
+    const { text, changed } = transformFlowText(src, rename, remove);
+    if (changed) writeFileSync(flow.file, text);
+  }
+  if (flowLoadedName !== null) {
+    const current = flowDetail.plainText;
+    const { text, changed } = transformFlowText(current, rename, remove);
+    if (changed) {
+      flowDetail.setText(text);
+      if (flowSavedText === current) flowSavedText = text;
+    }
+  }
+  reloadFlows();
+  if (appWindow === "flows") renderFlowList();
+}
+
+function remapKeyedMap<T>(map: Map<string, T>, remapKey: (key: string) => string | undefined) {
+  const entries = [...map.entries()].map(([key, value]) => [remapKey(key), value] as [string | undefined, T]);
+  map.clear();
+  for (const [key, value] of entries) if (key !== undefined) map.set(key, value);
+}
+
+// Keeps in-memory references (queue, variant pick, last results, open editor)
+// in sync with a request rename or delete.
+function remapRequestReferences(rename: Map<string, string>, remove: Set<string>) {
+  const remapKey = (key: string): string | undefined => {
+    const at = key.lastIndexOf("@");
+    const base = at > 0 ? key.slice(0, at) : key;
+    if (remove.has(base)) return undefined;
+    const mapped = rename.get(base);
+    return (mapped ?? base) + (at > 0 ? key.slice(at) : "");
+  };
+  const queue = [...flowQueue.entries()].map(([key, order]) => [remapKey(key), order] as [string | undefined, number]);
+  flowQueue.clear();
+  for (const [key, order] of queue) if (key !== undefined) flowQueue.set(key, order);
+  for (const [name, value] of [...activeVariant.entries()]) {
+    if (remove.has(name)) activeVariant.delete(name);
+    else if (rename.has(name)) { activeVariant.delete(name); activeVariant.set(rename.get(name)!, value); }
+  }
+  remapKeyedMap(lastResult, remapKey);
+  remapKeyedMap(lastBodies, remapKey);
+  if (editorEntry) {
+    if (remove.has(editorEntry.reqName)) editorEntry = null;
+    else if (rename.has(editorEntry.reqName)) editorEntry.reqName = rename.get(editorEntry.reqName)!;
+  }
+  normalizeFlowQueue();
+}
+
+function createRequestPath(value: string): boolean {
+  const parsed = parseNameInput(value, ".hurl");
+  if ("error" in parsed) { statusMsg = parsed.error; setStatus(); return false; }
+  if (parsed.kind === "dir") {
+    const dir = join(COLLECTION, parsed.path);
+    if (existsSync(dir)) { statusMsg = `folder ${parsed.path}/ already exists`; setStatus(); return false; }
+    mkdirSync(dir, { recursive: true });
+    reloadRequests();
+    selectRequestByName("", parsed.path);
+    statusMsg = `created ${parsed.path}/`;
+    setStatus();
+    return true;
+  }
+  const file = join(COLLECTION, `${parsed.path}.hurl`);
+  if (existsSync(file)) { statusMsg = `request ${parsed.path} already exists`; setStatus(); return false; }
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, "# TODO: describe this request\nGET {{host}}/\n");
+  reloadRequests();
+  refreshList(parsed.path);
+  setPane("editor");
+  statusMsg = `created ${parsed.path}`;
+  setStatus();
+  return true;
+}
+
+function renameRequestPath(value: string): boolean {
+  const row = currentTreeRow();
+  if (!row) return false;
+  const touchesDirty = editorDirty() && editorEntry && (row.type === "request" ? row.req.name === editorEntry.reqName : editorEntry.reqName.startsWith(`${row.path}/`));
+  if (touchesDirty) { warnDirty(editorEntry!.reqName); return false; }
+  const parsed = parseNameInput(value, ".hurl");
+  if ("error" in parsed) { statusMsg = parsed.error; setStatus(); return false; }
+  if (row.type === "folder") {
+    if (parsed.path === row.path) return false;
+    const target = join(COLLECTION, parsed.path);
+    if (existsSync(target)) { statusMsg = `folder ${parsed.path}/ already exists`; setStatus(); return false; }
+    const mapping = new Map<string, string>();
+    for (const req of requests) {
+      if (req.name.startsWith(`${row.path}/`)) mapping.set(req.name, `${parsed.path}${req.name.slice(row.path.length)}`);
+    }
+    mkdirSync(dirname(target), { recursive: true });
+    renameSync(join(COLLECTION, row.path), target);
+    applyFlowReferenceChange(mapping, new Set());
+    reloadRequests();
+    remapRequestReferences(mapping, new Set());
+    selectRequestByName("", parsed.path);
+    statusMsg = `renamed ${row.path}/ to ${parsed.path}/`;
+    setStatus();
+    return true;
+  }
+  const req = row.req;
+  if (parsed.path === req.name) return false;
+  const target = join(COLLECTION, `${parsed.path}.hurl`);
+  if (existsSync(target)) { statusMsg = `request ${parsed.path} already exists`; setStatus(); return false; }
+  mkdirSync(dirname(target), { recursive: true });
+  renameSync(req.file, target);
+  const mapping = new Map([[req.name, parsed.path]]);
+  applyFlowReferenceChange(mapping, new Set());
+  reloadRequests();
+  remapRequestReferences(mapping, new Set());
+  refreshList(parsed.path);
+  statusMsg = `renamed ${req.name} to ${parsed.path}`;
+  setStatus();
+  return true;
+}
+
+function deleteRequestPath() {
+  const row = currentTreeRow();
+  if (!row) return;
+  if (row.type === "folder") {
+    if (editorDirty() && editorEntry && editorEntry.reqName.startsWith(`${row.path}/`)) {
+      warnDirty(editorEntry.reqName);
+      return;
+    }
+    const names = new Set(requests.filter((req) => req.name.startsWith(`${row.path}/`)).map((req) => req.name));
+    applyFlowReferenceChange(new Map(), names);
+    rmSync(join(COLLECTION, row.path), { recursive: true, force: true });
+    reloadRequests();
+    remapRequestReferences(new Map(), names);
+    refreshList();
+    statusMsg = `deleted ${row.path}/`;
+    setStatus();
+    return;
+  }
+  const req = row.req;
+  if (editorDirty() && editorEntry && editorEntry.reqName === req.name) { warnDirty(editorEntry.reqName); return; }
+  applyFlowReferenceChange(new Map(), new Set([req.name]));
+  rmSync(req.file, { force: true });
+  reloadRequests();
+  remapRequestReferences(new Map(), new Set([req.name]));
+  refreshList();
+  statusMsg = `deleted ${req.name}`;
+  setStatus();
+}
+
+function showRequestNameInput(purpose: NamePurpose, prefill = "") {
+  pendingDelete = null;
+  requestNamePurpose = purpose;
+  requestNameInput.value = prefill;
+  requestNameInput.visible = true;
+  requestNameInput.focus();
+  setStatus();
+}
+
+function hideRequestNameInput() {
+  requestNameInput.visible = false;
+  requestNameInput.blur();
+  setStatus();
+}
+
+function requestNameInputFocused(): boolean {
+  return (requestNameInput as any).focused === true;
+}
+
+function submitRequestName(value: string) {
+  return requestNamePurpose === "rename" ? renameRequestPath(value) : createRequestPath(value);
+}
+
+// Prefill for `a` in the Requests tab: inside the selected folder, or the
+// selected request's parent directory, so the new file is a sibling.
+function requestCreatePrefill(): string {
+  const row = currentTreeRow();
+  if (!row) return "";
+  if (row.type === "folder") return `${row.path}/`;
+  const at = row.req.name.lastIndexOf("/");
+  return at > 0 ? row.req.name.slice(0, at + 1) : "";
+}
+
+function showRequestRenameInput() {
+  const row = currentTreeRow();
+  if (!row) return;
+  showRequestNameInput("rename", row.type === "folder" ? row.path : row.req.name);
+}
+
+// Arms a delete and asks for confirmation; the next key decides.
+function requestDelete(label: string, confirm: () => void) {
+  pendingDelete = { label, confirm };
+  statusMsg = `delete ${label}? (y/N)`;
+  setStatus();
+}
+
+function requestDeleteSelection() {
+  const row = currentTreeRow();
+  if (!row) return;
+  requestDelete(row.type === "folder" ? `${row.path}/` : row.req.name, () => deleteRequestPath());
+}
+
+function flowDeleteSelection() {
+  const row = currentFlowRow();
+  if (!row) return;
+  requestDelete(row.type === "folder" ? `flows/${row.path}/` : `flows/${row.flow.name}`, () => deleteFlowPath());
+}
+
 function watchCollection() {
   let timer: ReturnType<typeof setTimeout> | null = null;
   try {
@@ -2095,8 +3162,18 @@ function watchCollection() {
       timer = setTimeout(() => {
         envVariablesCache.clear();
         hurlFileCache.clear();
+        flowCache.clear();
         requests.splice(0, requests.length, ...loadRequests());
-        refreshList(undefined, appWindow === "workspace" && !insert && !editorDirty());
+        requestDirs.splice(0, requestDirs.length, ...loadRequestDirs());
+        flows.splice(0, flows.length, ...loadFlows());
+        flowDirs.splice(0, flowDirs.length, ...loadFlowDirs());
+        refreshList(undefined, appWindow === "requests" && !insert && !editorDirty());
+        if (appWindow === "flows") {
+          flowRows = buildFlowTree();
+          selectedFlowRow = Math.max(0, Math.min(selectedFlowRow, Math.max(0, flowRows.length - 1)));
+          renderFlowList();
+          if (!flowDirty()) loadFlowFile();
+        }
       }, 150);
     });
   } catch {}
@@ -2110,13 +3187,16 @@ function applyTextareaColors(target: TextareaRenderable) {
 }
 
 function refreshPaneBorders() {
-  listBox.borderColor = appWindow === "workspace" && pane === "list" ? C.yellow : C.dim;
-  editorBox.borderColor = appWindow === "workspace" && pane === "editor" ? C.yellow : C.dim;
-  responseBox.borderColor = appWindow === "workspace" && pane === "response" ? C.yellow : C.dim;
+  listBox.borderColor = appWindow === "requests" && pane === "list" ? C.yellow : C.dim;
+  editorBox.borderColor = appWindow === "requests" && pane === "editor" ? C.yellow : C.dim;
+  responseBox.borderColor = appWindow === "requests" && pane === "response" ? C.yellow : C.dim;
   historyListBox.borderColor = appWindow === "history" && historyPane === "list" ? C.yellow : C.dim;
   historyDetailBox.borderColor = appWindow === "history" && historyPane === "detail" ? C.yellow : C.dim;
   envListBox.borderColor = appWindow === "environments" && envPane === "list" ? C.yellow : C.dim;
   envDetailBox.borderColor = appWindow === "environments" && envPane === "editor" ? C.yellow : C.dim;
+  flowListBox.borderColor = appWindow === "flows" && flowPane === "list" ? C.yellow : C.dim;
+  flowDetailBox.borderColor = appWindow === "flows" && flowPane === "editor" ? C.yellow : C.dim;
+  flowResponseBox.borderColor = appWindow === "flows" && flowPane === "response" ? C.yellow : C.dim;
 }
 
 function applyPalette() {
@@ -2130,25 +3210,36 @@ function applyPalette() {
   editorGutter.bg = C.bg;
   envDetailGutter.fg = C.dim;
   envDetailGutter.bg = C.bg;
+  flowDetailGutter.fg = C.dim;
+  flowDetailGutter.bg = C.bg;
   filterInput.textColor = C.fg;
+  requestNameInput.textColor = C.fg;
+  flowNameInput.textColor = C.fg;
   helpOverlay.borderColor = C.yellow;
   helpText.textColor = C.fg;
+  flowPicker.borderColor = C.yellow;
+  flowPickerText.fg = C.fg;
+  flowPickerText.bg = C.bg;
   const backgroundBoxes = [
     listBox, treeList, editorBox, responseBox,
     historyWindow, historyListBox, historyList, historyDetailBox,
     envWindow, envListBox, envList, envDetailBox,
+    flowWindow, flowListBox, flowList, flowDetailBox, flowResponseBox,
     helpBackdrop, helpOverlay,
-    verticalDivider, horizontalDivider, historyDivider, environmentDivider,
+    flowPickerBackdrop, flowPicker,
+    verticalDivider, horizontalDivider, historyDivider, environmentDivider, flowDivider, flowHorizontalDivider,
   ];
   for (const box of backgroundBoxes) box.backgroundColor = C.bg;
-  for (const textarea of [editor, respView, historyDetail, envDetail]) applyTextareaColors(textarea);
+  for (const textarea of [editor, respView, historyDetail, envDetail, flowDetail, flowRespView]) applyTextareaColors(textarea);
   refreshPaneBorders();
   variableSyntax = buildVariableSyntax();
   responseFailureSyntax = buildResponseFailureSyntax();
   refreshEditorHighlights();
   if (lastResponse) applyResponseHighlights(respView, lastResponse.text, lastResponse.failed);
+  if (lastFlowResponse) applyResponseHighlights(flowRespView, lastFlowResponse.text, lastFlowResponse.failed);
   renderTree();
   renderEnvironments();
+  renderFlowList();
   if (historyGroups.length > 0) renderHistory();
   renderVariantStrip(currentReq());
   if (visual && visualTarget) updateVisualSelection(visualTarget);
@@ -2221,6 +3312,7 @@ function syncModeTitles() {
   if (envPane === "editor" || envInsert) {
     envDetailBox.title = envTitle(envInsert ? "insert" : visual && visualTarget === envDetail ? "visual" : "editor");
   }
+  flowDetailBox.title = flowTitle(flowInsert ? "insert" : visual && visualTarget === flowDetail ? "visual" : flowPane === "editor" ? "editor" : "list");
 }
 
 function clearVisual() {
@@ -2299,11 +3391,13 @@ function renderGutter(target: TextareaRenderable, gutter: TextRenderable) {
 function refreshGutters() {
   renderGutter(editor, editorGutter);
   renderGutter(envDetail, envDetailGutter);
+  renderGutter(flowDetail, flowDetailGutter);
 }
 
 function modeLabel(): string {
   if (appWindow === "history") return historyPane === "detail" ? (visual ? "VISUAL" : "RUN-DETAILS") : "HISTORY";
   if (appWindow === "environments") return envInsert ? "ENV-INSERT" : envPane === "editor" ? "ENV-NORMAL" : "ENVIRONMENTS";
+  if (appWindow === "flows") return flowInsert ? "FLOW-INSERT" : flowPane === "editor" ? "FLOW-NORMAL" : flowPane === "response" ? "FLOW-RESPONSE" : "FLOWS";
   if (pane === "editor") return insert ? "INSERT" : visual ? "REQ-VISUAL" : "REQ-NORMAL";
   if (pane === "response" && visual) return "VISUAL";
   return pane.toUpperCase();
@@ -2317,8 +3411,13 @@ function setStatus() {
   statusBar.fg = dirtyInfos.length > 0 ? C.yellow : C.fg;
   const mode = modeLabel();
   const last = [...lastResult.entries()].slice(-1)[0];
+  const windowLabel =
+    appWindow === "requests" ? "1 REQUESTS"
+      : appWindow === "flows" ? "2 FLOWS"
+        : appWindow === "history" ? "3 HISTORY"
+          : "4 ENVIRONMENTS";
   statusBar.content =
-    ` ${appWindow === "workspace" ? "1 WORKSPACE" : appWindow === "history" ? "2 HISTORY" : "3 ENVIRONMENTS"} · ${mode}` +
+    ` ${windowLabel} · ${mode}` +
     (dirtyInfos.length > 0 ? ` ${dirtyBufferLabel(dirtyInfos)}` : "") +
     ` · env: ${environments[environmentIdx]} · queued: ${flowQueue.size}` +
     (last ? ` · last: ${last[0]} ${last[1] === "ok" ? "✓" : "✗"}` : "") +
@@ -2331,6 +3430,7 @@ function setPane(p: Pane) {
   clearVisual();
   filterInput.blur();
   commandBuffer = null;
+  pendingDelete = null;
   pane = p;
   insert = false;
   pending = null;
@@ -2348,6 +3448,7 @@ function setPane(p: Pane) {
 function setHistoryPane(next: HistoryPane) {
   clearVisual();
   pending = null;
+  pendingDelete = null;
   historyPane = next;
   refreshPaneBorders();
   historyDetailBox.title = " RUN DETAILS ";
@@ -2360,13 +3461,20 @@ function setWindow(next: AppWindow) {
   clearVisual();
   filterInput.blur();
   commandBuffer = null;
+  pendingDelete = null;
   editor.blur();
   respView.blur();
   historyDetail.blur();
   envInsert = false;
   envDetail.blur();
+  flowInsert = false;
+  flowDetail.blur();
+  flowRespView.blur();
+  flowNameInput.visible = false;
+  flowNameInput.blur();
   appWindow = next;
-  main.visible = next === "workspace";
+  main.visible = next === "requests";
+  flowWindow.visible = next === "flows";
   historyWindow.visible = next === "history";
   envWindow.visible = next === "environments";
   if (next === "history") {
@@ -2385,6 +3493,12 @@ function setWindow(next: AppWindow) {
     envPane = "list";
     renderEnvironments();
     loadEnvironmentFile();
+  } else if (next === "flows") {
+    flowRows = buildFlowTree();
+    selectedFlowRow = Math.max(0, Math.min(selectedFlowRow, Math.max(0, flowRows.length - 1)));
+    flowPane = "list";
+    renderFlowList();
+    loadFlowFile();
   } else {
     setPane(pane);
   }
@@ -2437,7 +3551,38 @@ async function runRequest(req: Req) {
   recordHistory({ req, variant }, r);
   refreshList(req.name);
   statusMsg = "";
+  focusResponse("requests");
+}
+
+function formatFlowResponse(targets: RunTarget[], results: RunResult[], label: string): string {
+  const parts = targets.map((target, index) => {
+    const r = results[index] ?? emptyRunResult("Hurl did not return a result for this step");
+    const key = targetKey(target.req, target.variant);
+    lastResult.set(key, r.success ? "ok" : "fail");
+    if (r.body) lastBodies.set(key, r.body);
+    return `▸ ${index + 1}. ${key}\n${formatRun(r, target.variant)}`;
+  });
+  return `${label} (env: ${environments[environmentIdx]}), ${targets.length} requests\n\n` + parts.join(`\n\n${"─".repeat(60)}\n\n`);
+}
+
+async function runFlowTargets(targets: RunTarget[], label: string, surface: RunSurface = "requests") {
+  statusMsg = `running flow (${targets.length} requests)`;
   setStatus();
+  const results = await runHurl(targets);
+  lastBodies.clear();
+  const flowId = `flow-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  targets.forEach((target, index) => {
+    const r = results[index] ?? emptyRunResult("Hurl did not return a result for this step");
+    recordHistory(target, r, flowId, index + 1, targets.length);
+  });
+  const text = formatFlowResponse(targets, results, label);
+  const failed = results.some((result) => !result.success);
+  if (surface === "flows") renderFlowResponse(text, failed);
+  else renderResponse(text, failed);
+  refreshEditorHighlights();
+  refreshList(currentReq()?.name);
+  statusMsg = "";
+  focusResponse(surface);
 }
 
 async function runFlow() {
@@ -2450,25 +3595,17 @@ async function runFlow() {
     setStatus();
     return;
   }
-  statusMsg = `running flow (${targets.length} requests)`;
-  setStatus();
-  const results = await runHurl(targets);
-  lastBodies.clear();
-  const flowId = `flow-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  const parts = targets.map((target, index) => {
-    const r = results[index] ?? emptyRunResult("Hurl did not return a result for this step");
-    const key = targetKey(target.req, target.variant);
-    lastResult.set(key, r.success ? "ok" : "fail");
-    if (r.body) lastBodies.set(key, r.body);
-    const response = formatRun(r, target.variant);
-    recordHistory(target, r, flowId, index + 1, targets.length);
-    return `▸ ${index + 1}. ${key}\n${response}`;
-  });
-  renderResponse(`flow (env: ${environments[environmentIdx]}), ${targets.length} requests\n\n` + parts.join(`\n\n${"─".repeat(60)}\n\n`), results.some((result) => !result.success));
-  refreshEditorHighlights();
-  refreshList(currentReq()?.name);
-  statusMsg = "";
-  setStatus();
+  await runFlowTargets(targets, "flow");
+}
+
+async function runNamedFlow(flow: Flow, surface: RunSurface = "requests") {
+  const resolved = resolveFlow(flow);
+  if (resolved.error) {
+    statusMsg = resolved.error;
+    setStatus();
+    return;
+  }
+  await runFlowTargets(resolved.targets ?? [], `flow ${flow.name}`, surface);
 }
 
 function enterInsert() {
@@ -2576,10 +3713,10 @@ function moveVisual(target: TextareaRenderable, k: string, key: KeyEvent): boole
   return false;
 }
 
-function vimNormal(k: string, key: KeyEvent, target: TextareaRenderable = editor, readOnly = false, editKind: "request" | "environment" = "request") {
+function vimNormal(k: string, key: KeyEvent, target: TextareaRenderable = editor, readOnly = false, editKind: "request" | "environment" | "flow" = "request") {
   const eb = target.editBuffer;
   const shift = key.shift;
-  const startInsert = () => editKind === "environment" ? enterEnvInsert() : enterInsert();
+  const startInsert = () => editKind === "environment" ? enterEnvInsert() : editKind === "flow" ? enterFlowInsert() : enterInsert();
   const yankLine = () => {
     const { row } = eb.getCursorPosition();
     const start = eb.getLineStartOffset(row);
@@ -2692,6 +3829,34 @@ function parseCommandLine(c: string): ParsedCommand | null {
 function runCommandLine(cmd: string) {
   const c = cmd.trim();
   if (c === "") return;
+  if (c === "flows") {
+    showFlowPicker();
+    return;
+  }
+  const saveFlow = c.match(/^saveflow(!)?\s+(.+)$/);
+  if (saveFlow) {
+    statusMsg = saveCurrentQueue(saveFlow[2], Boolean(saveFlow[1]));
+    setStatus();
+    return;
+  }
+  const addStep = c.match(/^add\s+(.+)$/);
+  if (addStep) {
+    appendStepToFlow(addStep[1].trim());
+    return;
+  }
+  const newFlow = c.match(/^newflow\s+(.+)$/);
+  if (newFlow) {
+    if (appWindow === "flows") createFlowPath(newFlow[1]);
+    else statusMsg = "switch to the Flows tab (2) to create a flow";
+    setStatus();
+    return;
+  }
+  const rename = c.match(/^(?:rename|mv)\s+(.+)$/);
+  if (rename) {
+    if (appWindow === "flows") renameFlowPath(rename[1]);
+    else renameRequestPath(rename[1]);
+    return;
+  }
   const parsed = parseCommandLine(c);
   if (!parsed) {
     statusMsg = `not an editor command: ${c}`;
@@ -2701,11 +3866,14 @@ function runCommandLine(cmd: string) {
   const { write, quit, all, force } = parsed;
   const inEnvWindow = appWindow === "environments";
   const inEnvEditor = inEnvWindow && envPane === "editor";
-  const inReqEditor = appWindow === "workspace" && pane === "editor";
+  const inFlowWindow = appWindow === "flows";
+  const inFlowEditor = inFlowWindow && flowPane === "editor";
+  const inReqEditor = appWindow === "requests" && pane === "editor";
   if (all) {
     if (write) {
       if (editorDirty()) saveEditor();
       if (envDirty()) saveEnvironmentFile();
+      if (flowDirty()) saveFlowFile();
     }
     if (quit) {
       quitApp(force);
@@ -2714,6 +3882,7 @@ function runCommandLine(cmd: string) {
   }
   if (write && !quit) {
     if (inEnvWindow) saveEnvironmentFile();
+    else if (inFlowWindow) saveFlowFile();
     else saveEditor();
     return;
   }
@@ -2721,11 +3890,15 @@ function runCommandLine(cmd: string) {
     if (inEnvEditor) {
       saveEnvironmentFile();
       setEnvPane("list");
+    } else if (inFlowEditor) {
+      saveFlowFile();
+      setFlowPane("list");
     } else if (inReqEditor) {
       saveEditor();
       setPane("list");
     } else {
       if (inEnvWindow) saveEnvironmentFile();
+      else if (inFlowWindow) saveFlowFile();
       else saveEditor();
       quitApp(force);
     }
@@ -2739,6 +3912,16 @@ function runCommandLine(cmd: string) {
     }
     if (envDirty()) loadEnvironmentFile(true);
     setEnvPane("list");
+    return;
+  }
+  if (inFlowEditor) {
+    if (flowDirty() && !force) {
+      statusMsg = "no write since last change (add ! to override)";
+      setStatus();
+      return;
+    }
+    if (flowDirty()) loadFlowFile(true);
+    setFlowPane("list");
     return;
   }
   if (inReqEditor) {
@@ -2784,14 +3967,17 @@ const PANE_HELP: Record<string, [string, string][]> = {
     ["enter", "run request / toggle folder"],
     ["l", "toggle folder / open request pane"],
     ["shift-enter / ctrl-f", "run flow"],
+    ["ctrl-g / :flows", "run a saved flow"],
     ["tab", "queue/unqueue for flow"],
+    [":saveflow <name>", "save queue as a flow"],
     ["v / ]", "next variant"],
     ["[", "previous variant"],
     ["e / i / ctrl-l", "open request pane"],
+    ["a", "new request/folder"],
+    ["r", "rename request/folder"],
+    ["d", "delete request/folder (asks to confirm)"],
     ["y", "copy as hurl"],
     ["Y", "copy as curl"],
-    ["ctrl-n", "new request"],
-    ["ctrl-x", "delete request"],
     ["ctrl-p", "cycle environment"],
     ["alt+hjkl / alt-0", "resize panes / reset"],
     ["q", "quit"],
@@ -2826,7 +4012,7 @@ const PANE_HELP: Record<string, [string, string][]> = {
     ["enter / l / ctrl-l", "open details"],
     ["y", "copy all"],
     ["alt+hl / alt-0", "resize sidebar / reset"],
-    ["esc", "back to workspace"],
+    ["esc", "back to requests"],
     ["q", "quit"],
   ],
   "history-detail": [
@@ -2844,7 +4030,7 @@ const PANE_HELP: Record<string, [string, string][]> = {
     ["i", "open file and insert"],
     ["ctrl-r", "reveal/mask secrets"],
     ["alt+hl / alt-0", "resize sidebar / reset"],
-    ["esc / 1", "back to workspace"],
+    ["esc / 1", "back to requests"],
     ["q", "quit"],
   ],
   "env-editor": [
@@ -2858,6 +4044,42 @@ const PANE_HELP: Record<string, [string, string][]> = {
     ["ctrl-h", "back to list"],
     ["esc", "leave insert / cancel visual / back to list"],
   ],
+  "flows-list": [
+    ["j / k", "move"],
+    ["g / G", "jump to top / bottom"],
+    ["enter / l", "run flow / toggle folder"],
+    ["ctrl-f / shift-enter", "run flow"],
+    ["e / i / ctrl-l", "open flow editor"],
+    ["a", "new flow/folder"],
+    ["r", "rename flow/folder"],
+    ["d", "delete flow/folder (asks to confirm)"],
+    ["ctrl-g", "flow picker"],
+    ["alt+hl / alt-0", "resize sidebar / reset"],
+    ["esc", "back to requests"],
+    ["q", "quit"],
+  ],
+  "flows-editor": [
+    ...VIM_MOVE,
+    ...VIM_EDIT,
+    ["ctrl-a", "append selected request as a step"],
+    [":add <request>", "append a step by name"],
+    ["J / K", "move current step down / up"],
+    ["ctrl-s / :w", "save"],
+    [":wq / :x", "save and close pane"],
+    [":q / :q!", "close pane (bang discards changes)"],
+    ["ctrl-f / shift-enter", "run flow"],
+    ["ctrl-l", "response pane"],
+    ["ctrl-h", "back to list"],
+    ["esc", "leave insert / cancel visual / back to list"],
+  ],
+  "flows-response": [
+    ...VIM_MOVE,
+    ["v / V", "visual char / line"],
+    ["yy / Y", "yank line / yank all"],
+    ["s", "save bodies to file"],
+    ["ctrl-h", "back to flow editor"],
+    ["esc", "back to list"],
+  ],
 };
 
 function formatHelp(context: string): string {
@@ -2869,6 +4091,7 @@ function formatHelp(context: string): string {
 function helpContext(): keyof typeof PANE_HELP {
   if (appWindow === "history") return historyPane === "detail" ? "history-detail" : "history-list";
   if (appWindow === "environments") return envPane === "editor" ? "env-editor" : "env-list";
+  if (appWindow === "flows") return flowPane === "editor" ? "flows-editor" : flowPane === "response" ? "flows-response" : "flows-list";
   if (pane === "editor") return "editor";
   if (pane === "response") return "response";
   return "list";
@@ -2881,6 +4104,7 @@ function hideHelp() {
   helpOverlay.visible = false;
 }
 function showHelp() {
+  pendingDelete = null;
   helpVisible = true;
   helpText.setText(formatHelp(helpContext()));
   helpBackdrop.visible = true;
@@ -2897,11 +4121,30 @@ function handleInputShortcut(key: KeyEvent, k: string) {
     if (key.ctrl && k === "s") { saveEnvironmentFile(); key.preventDefault(); }
     else if (key.ctrl && k === "h") { leaveEnvInsert(); setEnvPane("list"); key.preventDefault(); }
     else if (k === "escape") { leaveEnvInsert(); key.preventDefault(); }
+  } else if (flowInsert) {
+    if (key.ctrl && k === "s") { saveFlowFile(); key.preventDefault(); }
+    else if (key.ctrl && k === "h") { leaveFlowInsert(); setFlowPane("list"); key.preventDefault(); }
+    else if (k === "escape") { leaveFlowInsert(); key.preventDefault(); }
   }
 }
 
 renderer.keyInput.on("keypress", (key: KeyEvent) => {
   const k = key.name;
+  if (flowPickerVisible) {
+    if (k === "escape" || k === "q") hideFlowPicker();
+    else if (k === "j" || k === "down") { flowPickerIndex = Math.min(flowPickerIndex + 1, Math.max(0, flows.length - 1)); renderFlowPicker(); }
+    else if (k === "k" || k === "up") { flowPickerIndex = Math.max(0, flowPickerIndex - 1); renderFlowPicker(); }
+    else if (k === "g") { flowPickerIndex = 0; renderFlowPicker(); }
+    else if (k === "G") { flowPickerIndex = Math.max(0, flows.length - 1); renderFlowPicker(); }
+    else if (k === "enter" || k === "return") {
+      const flow = flows[flowPickerIndex];
+      const surface: RunSurface = appWindow === "flows" ? "flows" : "requests";
+      hideFlowPicker();
+      if (flow) void runNamedFlow(flow, surface);
+    }
+    key.preventDefault();
+    return;
+  }
   if (helpVisible) { hideHelp(); setStatus(); key.preventDefault(); return; }
   if (filterInputFocused() && k === "escape") { filterInput.blur(); setPane("list"); key.preventDefault(); return; }
   if (commandBuffer !== null) {
@@ -2912,21 +4155,44 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
     key.preventDefault();
     return;
   }
-  if (k === "?" && !insert && !envInsert && !filterInputFocused()) { showHelp(); key.preventDefault(); return; }
-
   // Insert-style modes let the focused widget consume keys; only a few shortcuts are
   // intercepted. Every other key falls through to the single preventDefault below.
-  if (insert || envInsert || filterInputFocused()) { handleInputShortcut(key, k); return; }
+  if (flowNameInputFocused() || requestNameInputFocused()) {
+    const isFlow = flowNameInputFocused();
+    const input = isFlow ? flowNameInput : requestNameInput;
+    if (k === "escape") {
+      isFlow ? hideFlowNameInput() : hideRequestNameInput();
+      key.preventDefault();
+    } else if (k === "return" || k === "enter") {
+      const value = input.value;
+      isFlow ? hideFlowNameInput() : hideRequestNameInput();
+      if (value.trim()) { isFlow ? submitFlowName(value) : submitRequestName(value); }
+      key.preventDefault();
+    }
+    return;
+  }
+  if (pendingDelete) {
+    const pending = pendingDelete;
+    pendingDelete = null;
+    if (k === "y" || k === "Y") pending.confirm();
+    else { statusMsg = "delete cancelled"; setStatus(); }
+    key.preventDefault();
+    return;
+  }
+  if (k === "?" && !insert && !envInsert && !flowInsert && !filterInputFocused()) { showHelp(); key.preventDefault(); return; }
+
+  if (insert || envInsert || flowInsert || filterInputFocused()) { handleInputShortcut(key, k); return; }
   key.preventDefault();
 
   if (!visual && !pending) {
-    if (k === "1") { setWindow("workspace"); return; }
-    if (k === "2") { setWindow("history"); return; }
-    if (k === "3") { setWindow("environments"); return; }
+    if (k === "1") { setWindow("requests"); return; }
+    if (k === "2") { setWindow("flows"); return; }
+    if (k === "3") { setWindow("history"); return; }
+    if (k === "4") { setWindow("environments"); return; }
   }
 
   if ((key.meta || key.option) && !visual && !pending) {
-    if (appWindow === "workspace") {
+    if (appWindow === "requests") {
       if (k === "h") setSplits(sidebarSplit - 3, editorSplit);
       else if (k === "l") setSplits(sidebarSplit + 3, editorSplit);
       else if (k === "k") setSplits(sidebarSplit, editorSplit - 3);
@@ -2940,6 +4206,14 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
       else if (k === "0") setFixedSidebarSplit(44, historyWindow, historyListBox);
       else return;
       statusMsg = `history sidebar: ${historySplit} columns`;
+    } else if (appWindow === "flows") {
+      if (k === "h") setFixedSidebarSplit(flowSplit - 3, flowWindow, flowListBox);
+      else if (k === "l") setFixedSidebarSplit(flowSplit + 3, flowWindow, flowListBox);
+      else if (k === "j") setFlowDetailSplit(flowDetailSplit + 3);
+      else if (k === "k") setFlowDetailSplit(flowDetailSplit - 3);
+      else if (k === "0") { setFixedSidebarSplit(36, flowWindow, flowListBox); setFlowDetailSplit(55); }
+      else return;
+      statusMsg = `flows sidebar: ${flowSplit} columns, editor: ${flowDetailSplit}%`;
     } else {
       if (k === "h") setFixedSidebarSplit(environmentSplit - 3, envWindow, envListBox);
       else if (k === "l") setFixedSidebarSplit(environmentSplit + 3, envWindow, envListBox);
@@ -2963,7 +4237,7 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
     }
     if (key.ctrl && k === "l") { setEnvPane("editor"); return; }
     if (k === "l") { setEnvPane("editor"); return; }
-    if (k === "escape" || k === "1") { setWindow("workspace"); return; }
+    if (k === "escape" || k === "1") { setWindow("requests"); return; }
     if (k === "j") {
       const next = Math.min(environments.length - 1, selectedEnvironment + 1);
       if (envDirty() && environments[next] !== envLoadedName) { warnDirty(`.env.${envLoadedName}`); return; }
@@ -2988,6 +4262,59 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
     return;
   }
 
+  if (appWindow === "flows") {
+    if (k === "q") { quitApp(); return; }
+    if (flowPane === "editor") {
+      if (key.ctrl && k === "s") { saveFlowFile(); return; }
+      if (key.ctrl && k === "l") { setFlowPane("response"); return; }
+      if (key.ctrl && k === "h") { setFlowPane("list"); return; }
+      if (key.ctrl && k === "a") { appendStepToFlow(); return; }
+      if (key.ctrl && k === "f") { const flow = currentFlow(); if (flow) void runNamedFlow(flow, "flows"); return; }
+      if ((k === "enter" || k === "return") && key.shift) { const flow = currentFlow(); if (flow) void runNamedFlow(flow, "flows"); return; }
+      if (k === "escape") { setFlowPane("list"); return; }
+      if (!visual && (k === ":" || (k === ";" && key.shift))) { enterCommandLine(); return; }
+      if (!visual && (k === "J" || (k === "j" && key.shift))) { moveFlowLine(1); return; }
+      if (!visual && (k === "K" || (k === "k" && key.shift))) { moveFlowLine(-1); return; }
+      vimNormal(k, key, flowDetail, false, "flow");
+      return;
+    }
+    if (flowPane === "response") {
+      if (key.ctrl && k === "h") { setFlowPane("editor"); return; }
+      if (k === "escape") { setFlowPane("list"); return; }
+      if (!visual && (k === ":" || (k === ";" && key.shift))) { enterCommandLine(); return; }
+      if (k === "s") { statusMsg = saveLastBodies(); setStatus(); return; }
+      vimNormal(k, key, flowRespView, true);
+      return;
+    }
+    if (!visual && (k === ":" || (k === ";" && key.shift))) { enterCommandLine(); return; }
+    if (key.ctrl && k === "l") { setFlowPane("editor"); return; }
+    if (k === "l") {
+      const row = currentFlowRow();
+      if (row?.type === "folder") toggleFlowFolder(row.path);
+      else setFlowPane("editor");
+      return;
+    }
+    if (k === "escape") { setWindow("requests"); return; }
+    if (k === "j") { moveFlowSelection(1); return; }
+    if (k === "k") { moveFlowSelection(-1); return; }
+    if (k === "g" && !key.shift) { moveFlowSelection(-selectedFlowRow); return; }
+    if (k === "G" || (k === "g" && key.shift)) { moveFlowSelection(flowRows.length - 1 - selectedFlowRow); return; }
+    if (k === "enter" || k === "return") {
+      const row = currentFlowRow();
+      if (row?.type === "folder") { toggleFlowFolder(row.path); return; }
+      const flow = currentFlow();
+      if (flow) void runNamedFlow(flow, "flows");
+      return;
+    }
+    if (key.ctrl && k === "f") { const flow = currentFlow(); if (flow) void runNamedFlow(flow, "flows"); return; }
+    if (k === "e" || k === "i") { if (currentFlow()) { setFlowPane("editor"); if (k === "i") enterFlowInsert(); } return; }
+    if (k === "a") { showFlowNameInput("create", flowCreatePrefill()); return; }
+    if (k === "r") { showFlowRenameInput(); return; }
+    if (k === "d") { flowDeleteSelection(); return; }
+    if (key.ctrl && k === "g") { showFlowPicker(); return; }
+    return;
+  }
+
   if (appWindow === "history") {
     if (historyPane === "detail") {
       if (key.ctrl && k === "h") { setHistoryPane("list"); return; }
@@ -2996,7 +4323,7 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
       return;
     }
     if (k === "q") { quitApp(); return; }
-    if (k === "escape") { setWindow("workspace"); return; }
+    if (k === "escape") { setWindow("requests"); return; }
     if (k === "j") { moveHistory(1); return; }
     if (k === "k") { moveHistory(-1); return; }
     if (key.ctrl && k === "d") { moveHistory(5); return; }
@@ -3074,38 +4401,15 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
       return;
     }
     if (k === "f" && key.ctrl) { runFlow(); return; }
+    if (k === "g" && key.ctrl) { showFlowPicker(); return; }
     if (k === "e") { setPane("editor"); return; }
     if (k === "i") { setPane("editor"); enterInsert(); return; }
     if (k === "v") { cycleVariant(1); return; }
     if (k === "[") { cycleVariant(-1); return; }
     if (k === "]") { cycleVariant(1); return; }
-    if (k === "n" && key.ctrl) {
-      if (editorDirty() && editorEntry) { warnDirty(editorEntry.reqName); return; }
-      const name = `untitled-${Date.now() % 100000}`;
-      const file = join(COLLECTION, `${name}.hurl`);
-      const template = "# TODO: describe this request\nGET {{host}}/\n";
-      writeFileSync(file, template);
-      requests.push({ name, file, desc: "TODO", method: "GET", path: "/", vars: [], variants: [] });
-      requests.sort((a, b) => a.name.localeCompare(b.name));
-      refreshList(name);
-      editor.setText(template);
-      setPane("editor");
-      return;
-    }
-    if (k === "x" && key.ctrl) {
-      const r = currentReq();
-      if (r && editorDirty() && editorEntry && r.name === editorEntry.reqName) { warnDirty(editorEntry.reqName); return; }
-      if (r) {
-        rmSync(r.file);
-        requests.splice(requests.indexOf(r), 1);
-        for (const key of [...flowQueue.keys()]) if (key === r.name || key.startsWith(`${r.name}@`)) flowQueue.delete(key);
-        normalizeFlowQueue();
-        activeVariant.delete(r.name);
-        for (const key of [...lastResult.keys()]) if (key === r.name || key.startsWith(`${r.name}@`)) lastResult.delete(key);
-        refreshList(); statusMsg = `deleted ${r.name}`; setStatus();
-      }
-      return;
-    }
+    if (k === "a") { showRequestNameInput("create", requestCreatePrefill()); return; }
+    if (k === "r") { showRequestRenameInput(); return; }
+    if (k === "d") { requestDeleteSelection(); return; }
     if (k === "y" && !key.shift) {
       const r = currentReq();
       if (r) {
@@ -3131,22 +4435,7 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
       setStatus(); return;
     }
     if (k === "s") {
-      if (lastBodies.size === 0) {
-        statusMsg = "no body to save, run a request first";
-        setStatus(); return;
-      }
-      const dir = join(COLLECTION, ".termurl", "bodies");
-      mkdirSync(dir, { recursive: true });
-      const stamp = Date.now();
-      const saved: string[] = [];
-      for (const [name, body] of lastBodies) {
-        const trimmed = body.trim();
-        const ext = trimmed.startsWith("{") || trimmed.startsWith("[") ? "json" : "txt";
-        const file = join(dir, `${stamp}-${name.replaceAll("/", "-")}.${ext}`);
-        writeFileSync(file, body);
-        saved.push(file);
-      }
-      statusMsg = saved.length === 1 ? `body saved: ${saved[0]}` : `${saved.length} bodies saved to ${dir}`;
+      statusMsg = saveLastBodies();
       setStatus(); return;
     }
     vimNormal(k, key, respView, true);
@@ -3174,25 +4463,49 @@ envDetail.onKeyDown = (key) => {
     leaveEnvInsert();
     setEnvPane("list");
     key.preventDefault();
-  } else if (key.name === "escape" || key.name === "esc" || key.sequence === "") {
+  } else if (key.name === "escape" || key.name === "esc" || key.sequence === "\u001b") {
     leaveEnvInsert();
+    key.preventDefault();
+  }
+};
+flowDetail.onContentChange = () => {
+  syncModeTitles();
+  setStatus();
+};
+flowDetail.onKeyDown = (key) => {
+  if (!flowInsert) return;
+  if (key.ctrl && key.name === "s") {
+    saveFlowFile();
+    key.preventDefault();
+  } else if (key.ctrl && key.name === "h") {
+    leaveFlowInsert();
+    setFlowPane("list");
+    key.preventDefault();
+  } else if (key.name === "escape" || key.name === "esc") {
+    leaveFlowInsert();
     key.preventDefault();
   }
 };
 
 loadHistory();
 refreshList(requests[0]?.name);
+renderFlowList();
 if (requests.length === 0) statusMsg = `no .hurl files found in ${COLLECTION}`;
 setStatus();
-setWindow("workspace");
+setWindow("requests");
 setPane("list");
 watchCollection();
 watchOmarchyTheme();
 let snapEditorHeight = true;
+let snapFlowDetailHeight = true;
 renderer.on("frame" as any, () => {
   if (snapEditorHeight && editorBox.height > 0) {
     snapEditorHeight = false;
     editorBox.height = Math.round(editorBox.height);
+  }
+  if (snapFlowDetailHeight && flowDetailBox.height > 0) {
+    snapFlowDetailHeight = false;
+    flowDetailBox.height = Math.round(flowDetailBox.height);
   }
   refreshGutters();
   renderCommandLine();
@@ -3200,6 +4513,8 @@ renderer.on("frame" as any, () => {
 renderer.on("resize" as any, () => {
   editorBox.height = `${editorSplit}%`;
   snapEditorHeight = true;
+  flowDetailBox.height = `${flowDetailSplit}%`;
+  snapFlowDetailHeight = true;
   refreshGutters();
   renderCommandLine();
 });
