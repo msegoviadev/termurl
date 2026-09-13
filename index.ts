@@ -1195,10 +1195,10 @@ let lastRowClick = { index: -1, time: 0 };
 function requestLabel(r: Req): string {
   const variant = currentVariant(r);
   const order = flowQueue.get(targetKey(r, variant));
-  const mark = order === undefined ? "[ ]" : `[${order}]`;
+  const mark = order === undefined ? "" : `[${order}] `;
   const name = r.name.split("/").pop() ?? r.name;
   const suffix = variant ? ` @${variant}` : r.variants.length > 0 ? ` +${r.variants.length}` : "";
-  return `${mark} ${r.method.padEnd(6)} ${name}${suffix}`;
+  return `${mark}${r.method.padEnd(6)} ${name}${suffix}`;
 }
 
 const root = new BoxRenderable(renderer, { flexDirection: "column", width: "100%", height: "100%" });
@@ -1447,15 +1447,15 @@ const flowList = new BoxRenderable(renderer, {
   flexDirection: "column",
   backgroundColor: C.bg,
 });
-flowListBox.add(flowList);
 
 const flowNameInput = new InputRenderable(renderer, {
-  placeholder: "new flow name",
+  placeholder: "name (end with / for a folder)",
   backgroundColor: "transparent",
   textColor: C.fg,
   visible: false,
 });
 flowListBox.add(flowNameInput);
+flowListBox.add(flowList);
 
 const flowRightCol = new BoxRenderable(renderer, { flexDirection: "column", flexGrow: 1, flexBasis: 0 });
 flowWindow.add(flowRightCol);
@@ -2264,7 +2264,7 @@ function renderFlowList() {
       content,
       width: "100%",
       height: 1,
-      fg: row.type === "folder" ? C.cyan : selected ? C.fg : C.dim,
+      fg: row.type === "folder" ? C.cyan : C.fg,
       bg: selected ? C.selected : C.bg,
       truncate: true,
       selectable: false,
