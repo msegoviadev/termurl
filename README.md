@@ -127,6 +127,11 @@ Useful controls:
 - `1`: Requests, `2`: Flows, `3`: History, `4`: Environments.
 - `?`: show shortcuts for the current pane; `q`: quit.
 
+Requests are listed by name only and colored by HTTP method (GET green, POST
+blue, PUT yellow, PATCH magenta, DELETE red, HEAD orange, OPTIONS default);
+press `?` in the Requests list for the color legend. Queued requests get an
+`[n]` prefix.
+
 Mouse support includes pane focus, cursor positioning, row selection, folder
 expansion, double-click queue toggling, drag selection in text areas, and
 dragging the pane dividers to resize (the highlighted bar also shows a

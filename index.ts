@@ -179,6 +179,8 @@ type Palette = {
   red: string;
   blue: string;
   cyan: string;
+  magenta: string;
+  orange: string;
   panel: string;
   selected: string;
   active: string;
@@ -193,6 +195,8 @@ const DEFAULT_PALETTE: Palette = {
   red: "#f7768e",
   blue: "#7aa2f7",
   cyan: "#7dcfff",
+  magenta: "#bb9af7",
+  orange: "#ff9e64",
   panel: "#24283b",
   selected: "#292e42",
   active: "#3b4261",
@@ -218,6 +222,8 @@ function loadOmarchyPalette(): Palette | null {
     red: hex(colors.red, DEFAULT_PALETTE.red),
     blue: hex(colors.blue, DEFAULT_PALETTE.blue),
     cyan: hex(colors.bright_cyan ?? colors.cyan, DEFAULT_PALETTE.cyan),
+    magenta: hex(colors.magenta, DEFAULT_PALETTE.magenta),
+    orange: hex(colors.orange, DEFAULT_PALETTE.orange),
     panel: hex(colors.lighter_background, DEFAULT_PALETTE.panel),
     selected: hex(colors.selection, DEFAULT_PALETTE.selected),
     active: hex(colors.muted, DEFAULT_PALETTE.active),
@@ -925,7 +931,7 @@ function flowsListCommand(json: boolean): number {
   }
   const width = flows.reduce((max, flow) => Math.max(max, flow.name.length), 0);
   for (const flow of flows) {
-    console.log(`${flow.name.padEnd(width)}  ${flow.steps.length} steps${flow.desc ? `  - ${flow.desc}` : ""}`);
+    console.log(`${flow.name.padEnd(width)}  ${flow.steps.length} steps`);
   }
   return 0;
 }
@@ -1196,13 +1202,26 @@ let treeRows: TreeRow[] = [];
 let selectedRow = 0;
 let lastRowClick = { index: -1, time: 0 };
 
+function methodColor(method: string): string {
+  switch (method.toUpperCase()) {
+    case "GET": return C.green;
+    case "POST": return C.blue;
+    case "PUT": return C.yellow;
+    case "PATCH": return C.magenta;
+    case "DELETE": return C.red;
+    case "HEAD": return C.orange;
+    case "OPTIONS": return C.fg;
+    default: return C.dim;
+  }
+}
+
 function requestLabel(r: Req): string {
   const variant = currentVariant(r);
   const order = flowQueue.get(targetKey(r, variant));
   const mark = order === undefined ? "" : `[${order}] `;
   const name = r.name.split("/").pop() ?? r.name;
   const suffix = variant ? ` @${variant}` : r.variants.length > 0 ? ` +${r.variants.length}` : "";
-  return `${mark}${r.method.padEnd(6)} ${name}${suffix}`;
+  return `${mark}${name}${suffix}`;
 }
 
 const root = new BoxRenderable(renderer, { flexDirection: "column", width: "100%", height: "100%" });
@@ -1566,6 +1585,11 @@ const helpOverlay = new BoxRenderable(renderer, {
 });
 root.add(helpOverlay);
 
+const helpLegend = new TextRenderable(renderer, {
+  content: "", height: 1, fg: C.fg, bg: C.bg, selectable: false, visible: false,
+} as any);
+helpOverlay.add(helpLegend);
+
 const helpText = new TextareaRenderable(renderer, { backgroundColor: "transparent", textColor: C.fg, selectable: false, flexGrow: 1 });
 helpText.onKeyDown = (key) => key.preventDefault();
 helpText.onPaste = (event) => event.preventDefault();
@@ -1602,7 +1626,7 @@ function renderFlowPicker() {
   flowPickerIndex = Math.max(0, Math.min(flowPickerIndex, flows.length - 1));
   flowPickerText.content = flows.map((flow, index) => {
     const marker = index === flowPickerIndex ? ">" : " ";
-    return `${marker} ${flow.name}  (${flow.steps.length} steps)${flow.desc ? `  - ${flow.desc}` : ""}`;
+    return `${marker} ${flow.name}  (${flow.steps.length} steps)`;
   }).join("\n");
 }
 
@@ -2214,7 +2238,7 @@ function flowTitle(state: "list" | "editor" | "insert" | "visual"): string {
 
 function flowLabel(flow: Flow): string {
   const name = flow.name.split("/").pop() ?? flow.name;
-  return `${name}  (${flow.steps.length} steps)${flow.desc ? `  - ${flow.desc}` : ""}`;
+  return `${name}  (${flow.steps.length} steps)`;
 }
 
 // Builds the folder/flow rows for the Flows tab from flowDirs + flows. Directories
@@ -2268,7 +2292,7 @@ function renderFlowList() {
       content,
       width: "100%",
       height: 1,
-      fg: row.type === "folder" ? C.cyan : C.fg,
+      fg: C.fg,
       bg: selected ? C.selected : C.bg,
       truncate: true,
       selectable: false,
@@ -2629,8 +2653,8 @@ function historyDayLabel(ts: string): string {
   return date.getFullYear() === now.getFullYear() ? label : `${label} ${date.getFullYear()}`;
 }
 
-function historyTitle(group: HistoryGroup, selected: boolean): StyledText {
-  const base = fg(selected ? C.fg : C.dim);
+function historyTitle(group: HistoryGroup): StyledText {
+  const base = fg(C.fg);
   const status = fg(historyFailed(group) ? C.red : C.green);
   const time = historyTime(group.ts);
   if (group.flow) {
@@ -2691,10 +2715,10 @@ function renderHistory() {
       }));
     }
     const rowRenderable = new TextRenderable(renderer, {
-      content: historyTitle(group, index === selectedHistory),
+      content: historyTitle(group),
       width: "100%",
       height: 1,
-      fg: index === selectedHistory ? C.fg : C.dim,
+      fg: C.fg,
       bg: index === selectedHistory ? C.selected : C.bg,
       truncate: true,
       selectable: false,
@@ -2890,7 +2914,7 @@ function renderTree() {
       content,
       width: "100%",
       height: 1,
-      fg: row.type === "folder" ? C.cyan : C.fg,
+      fg: row.type === "folder" ? C.fg : methodColor(row.req.method),
       bg: selected ? C.selected : C.bg,
       truncate: true,
       selectable: false,
@@ -3264,6 +3288,8 @@ function applyPalette() {
   flowNameInput.textColor = C.fg;
   helpOverlay.borderColor = C.yellow;
   helpText.textColor = C.fg;
+  helpLegend.bg = C.bg;
+  if (helpVisible) { helpLegend.content = renderHelpLegend(); helpLegend.visible = helpContext() === "list"; }
   flowPicker.borderColor = C.yellow;
   flowPickerText.fg = C.fg;
   flowPickerText.bg = C.bg;
@@ -4136,6 +4162,12 @@ function formatHelp(context: string): string {
   return rows.map(([key, desc]) => `${key.padEnd(width)} : ${desc}`).join("\n");
 }
 
+function renderHelpLegend(): StyledText {
+  const base = fg(C.dim);
+  const sep = base("  ");
+  return t`${base("methods:  ")}${fg(C.green)("GET")}${sep}${fg(C.blue)("POST")}${sep}${fg(C.yellow)("PUT")}${sep}${fg(C.magenta)("PATCH")}${sep}${fg(C.red)("DELETE")}${sep}${fg(C.orange)("HEAD")}${sep}${fg(C.fg)("OPTIONS")}`;
+}
+
 function helpContext(): keyof typeof PANE_HELP {
   if (appWindow === "history") return historyPane === "detail" ? "history-detail" : "history-list";
   if (appWindow === "environments") return envPane === "editor" ? "env-editor" : "env-list";
@@ -4154,6 +4186,8 @@ function hideHelp() {
 function showHelp() {
   pendingDelete = null;
   helpVisible = true;
+  helpLegend.content = renderHelpLegend();
+  helpLegend.visible = helpContext() === "list";
   helpText.setText(formatHelp(helpContext()));
   helpBackdrop.visible = true;
   helpOverlay.visible = true;
