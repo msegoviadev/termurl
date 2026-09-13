@@ -7,6 +7,9 @@ import {
   InputRenderable,
   RGBA,
   SyntaxStyle,
+  t,
+  fg,
+  type StyledText,
   type KeyEvent,
 } from "@opentui/core";
 import packageJson from "./package.json" with { type: "json" };
@@ -1712,15 +1715,42 @@ function historyStatus(group: HistoryGroup): string {
   return failed ? `${failed.status} FAIL` : "OK";
 }
 
-function historyTime(ts: string): string {
-  return ts.includes("T") ? ts.slice(11, 16) : ts;
+function historyFailed(group: HistoryGroup): boolean {
+  return group.steps.some((step) => step.success === false || step.status >= 400);
 }
 
-function historyTitle(group: HistoryGroup): string {
-  if (group.flow) return `${historyTime(group.ts)}  FLOW  ${group.steps.length} steps  ${historyStatus(group)}`;
+function historyTime(ts: string): string {
+  const date = new Date(ts);
+  if (Number.isNaN(date.getTime())) return ts;
+  return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+}
+
+function historyDayKey(ts: string): string {
+  const date = new Date(ts);
+  if (Number.isNaN(date.getTime())) return ts;
+  return `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`;
+}
+
+function historyDayLabel(ts: string): string {
+  const date = new Date(ts);
+  if (Number.isNaN(date.getTime())) return "Earlier";
+  const now = new Date();
+  const startOfDay = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  const daysAgo = Math.round((startOfDay(now) - startOfDay(date)) / 86400000);
+  if (daysAgo === 0) return "Today";
+  if (daysAgo === 1) return "Yesterday";
+  const label = date.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" });
+  return date.getFullYear() === now.getFullYear() ? label : `${label} ${date.getFullYear()}`;
+}
+
+function historyTitle(group: HistoryGroup, selected: boolean): StyledText {
+  const base = fg(selected ? C.fg : C.dim);
+  const status = fg(historyFailed(group) ? C.red : C.green);
+  const time = historyTime(group.ts);
+  if (group.flow) return t`${base(`${time}  FLOW  ${group.steps.length} steps  `)}${status(historyStatus(group))}`;
   const step = group.steps[0];
   const request = step ? targetKeyLabel(step) : "unknown";
-  return `${historyTime(group.ts)}  ${request}  ${historyStatus(group)}`;
+  return t`${base(`${time}  ${request}  `)}${status(historyStatus(group))}`;
 }
 
 function targetKeyLabel(step: HistoryRecord): string {
@@ -1752,9 +1782,25 @@ function renderHistory() {
     historyList.remove(child);
     child.destroy();
   }
+  let lastDayKey = "";
   historyGroups.forEach((group, index) => {
+    const dayKey = historyDayKey(group.ts);
+    if (dayKey !== lastDayKey) {
+      lastDayKey = dayKey;
+      const label = historyDayLabel(group.ts);
+      const ruleWidth = Math.max(0, Math.floor(historyList.width || 20) - label.length - 4);
+      historyList.add(new TextRenderable(renderer, {
+        content: ` ${label} ${"─".repeat(ruleWidth)}`,
+        width: "100%",
+        height: 1,
+        fg: C.dim,
+        bg: C.bg,
+        truncate: true,
+        selectable: false,
+      }));
+    }
     const rowRenderable = new TextRenderable(renderer, {
-      content: historyTitle(group),
+      content: historyTitle(group, index === selectedHistory),
       width: "100%",
       height: 1,
       fg: index === selectedHistory ? C.fg : C.dim,
