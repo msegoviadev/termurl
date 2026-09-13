@@ -1,85 +1,84 @@
 ---
 name: termurl
-description: Run HTTP requests from a termurl hurl collection headlessly, inspect available requests and environments, and chain requests with captures.
+description: Run HTTP requests headlessly from a termurl hurl collection: check setup, discover requests, environments, and saved flows, and run requests/flows with variants and captures.
 ---
 
 # termurl
 
-Use termurl's subcommands for agent work. Do not open the TUI from an automated
-workflow.
+Use termurl's headless subcommands for agent work; the interactive TUI is not
+available to automated workflows.
 
 ## Setup
 
-Run `termurl doctor` first. If the config is missing, run
-`termurl init --yes [collection-path]`. The external `hurl` binary, version 8 or
-newer, must be on `PATH`.
+- `termurl doctor --json` checks hurl, config, and the collection. It runs even
+  without a valid config and exits non-zero when a check fails, so gate on the
+  top-level `ok`; details are under `hurl`, `config`, `collection`, `requests`,
+  and `environments`.
+- If the config is missing, `termurl init --yes [collection-path]` writes it and
+  scaffolds `requests/`, `flows/`, `.env.dev`, and `.env.example`.
+- The external `hurl` binary, version 8 or newer, must be on `PATH`.
+
+A collection is a directory: requests live under `<collection>/requests`, saved
+flows under `<collection>/flows`, and environment dotfiles (`.env.<name>`) and
+`.termurl/` stay at the root. Request and flow files are plain text, so agents
+may create or edit them on disk.
 
 ## Discover
 
-- `termurl list --json` lists request names, files, methods, paths, descriptions,
-  variables, and variants.
-- `termurl show <request>` prints the raw hurl file. Append `@variant` to print
-  only that entry, e.g. `termurl show specs/get@bad-payload`.
-- `termurl env list --json` lists available environments.
-- `termurl env show <name>` displays environment variables. Keys prefixed with
-  `secret_` are masked unless `--reveal` is explicitly used.
-- `termurl flows list --json` lists saved flows with their steps and descriptions.
+- `termurl list --json` returns an array of
+  `{name, file, method, path, description, variables, variants}`.
+- `termurl show <request[@variant]>` prints the raw `.hurl` file, or a single
+  entry when `@variant` is given, e.g. `termurl show specs/get@bad-payload`.
+- `termurl env list --json` returns an array of environment names.
+- `termurl env show <name> [--reveal] [--json]` returns
+  `{environment, variables: [{key, value, source, secret, masked}]}`. Keys
+  prefixed with `secret_` are masked unless `--reveal` is passed.
+- `termurl flows list --json` returns `{name, file, description, steps}`, where
+  `steps` are the raw `request[@variant]` lines and `description` is the first
+  comment.
 - `termurl flows show <name>` prints a flow file.
 
-Request names are the path under `<collection>/requests` without `.hurl`, for
-example `specs/get`. A `.hurl` suffix is also accepted. Run requests explicitly,
-never by passing a directory.
+Naming: a request name is its path under `requests/` without `.hurl`
+(`specs/get`); a flow name is its path under `flows/` without `.flow`
+(`admin/reset`). A `.hurl`/`.flow` suffix or an explicit file path is also
+accepted. A bare name is matched to a request first, then to a flow.
 
 ## Run
 
-Use `--json` when the result needs to be inspected programmatically:
-
 ```bash
 termurl run specs/get --env dev --json
-```
-
-The JSON result includes status, duration, headers, the raw response body,
-assert counts, and captured values. A single request returns an object. Multiple
-requests return an array.
-
-Without `--json`, one request writes only its raw response body to stdout:
-
-```bash
-termurl run auth/login --env dev | jq -r .token
-```
-
-Multiple requests run as one ordered flow, so hurl captures from earlier
-requests are available to later requests:
-
-```bash
 termurl run auth/login users/me --env dev
-```
-
-A saved flow runs the same way by name, and can be mixed with explicit requests:
-
-```bash
-termurl run auth-check --env dev --json
-```
-
-Requests can define variants (alternative headers and body in the same file).
-Run one by appending `@variant` to the name, including inside flows:
-
-```bash
-termurl run anything/post@bad-payload --env dev --json
+termurl run auth-check --env dev --json          # saved flow by name
 termurl run auth/login anything/post@xml --env dev
 ```
 
-Pass ad-hoc variables with repeatable `--var KEY=value`. Captures exist only
-inside one invocation. Use `--quiet` when a response body must be the only
-stdout output and the normal report on stderr is not needed.
+- Positional targets are requests, `request@variant`, saved flows, or file
+  paths, run in argument order; requests and flows can be mixed. Captures exist
+  only within one invocation and feed later steps.
+- `--variant <name>` applies to any request without an explicit `@variant`,
+  including flow steps.
+- `--var KEY=value` adds a variable, repeatable. Precedence is captures, then
+  `--var` values, then the `.env.<name>` file.
+- Always pass `--env` for deterministic runs; without it the active environment
+  is the first `.env.<name>` (or the `environment` key in config).
+
+Output:
+
+- With `--json`, stdout is a single object for one target or an array for
+  several, including status, duration, headers, body, assert counts, and
+  captures. Prefer this for agents.
+- Without `--json`, one target writes only its response body to stdout; multiple
+  targets are separated by `==> <name>` lines. `-q`/`--quiet` keeps the run
+  report off stderr.
+- `termurl --help` lists every command and option.
 
 ## Streams and exit codes
 
-- stdout contains only the response body, flow bodies, or `--json` output.
-- stderr contains status reports, diagnostics, and assertion messages.
-- Exit `0` means all requests passed.
+- stdout contains only response bodies, flow bodies, or `--json` output.
+- stderr contains run reports, diagnostics, and assertion messages.
+- Exit `0` means all targets passed.
 - Exit `1` means usage or configuration failed.
-- Exit `2` means a request could not run.
-- Exit `3` means a request ran but failed an assertion.
+- Exit `2` means a target could not run.
+- Exit `3` means a target ran but failed an assertion.
 
 Never run bare `termurl` in an automated workflow because it opens the TUI.
