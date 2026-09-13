@@ -989,6 +989,7 @@ let environmentSplit = 32;
 const listBox = new BoxRenderable(renderer, {
   width: `${sidebarSplit}%`, flexShrink: 0, border: true, borderStyle: "single", title: " REQUESTS ", flexDirection: "column",
   borderColor: C.dim, backgroundColor: C.bg,
+  padding: 1,
 });
 main.add(listBox);
 
@@ -1020,10 +1021,17 @@ rightCol.add(editorBox);
 const editor = new TextareaRenderable(renderer, {
   initialValue: requests[0] ? entrySource(requests[0]) : "",
   backgroundColor: C.bg, textColor: C.fg,
-  width: "100%", height: "100%",
+  flexGrow: 1, flexBasis: 0, height: "100%",
   selectable: true,
 });
-editorBox.add(editor);
+
+const editorGutter = new TextRenderable(renderer, {
+  content: "", width: 3, height: "100%", flexShrink: 0, fg: C.dim, bg: C.bg, selectable: false,
+} as any);
+const editorWrap = new BoxRenderable(renderer, { flexDirection: "row", width: "100%", flexGrow: 1, flexBasis: 0 });
+editorWrap.add(editorGutter);
+editorWrap.add(editor);
+editorBox.add(editorWrap);
 
 const variantStrip = new BoxRenderable(renderer, {
   height: 1, flexShrink: 0, flexDirection: "row", backgroundColor: C.panel, visible: false,
@@ -1070,6 +1078,7 @@ const historyListBox = new BoxRenderable(renderer, {
   borderColor: C.dim,
   backgroundColor: C.bg,
   flexDirection: "column",
+  padding: 1,
 });
 historyWindow.add(historyListBox);
 
@@ -1092,6 +1101,7 @@ const historyDetailBox = new BoxRenderable(renderer, {
   title: " RUN DETAILS ",
   borderColor: C.dim,
   backgroundColor: C.bg,
+  padding: 1,
 });
 historyWindow.add(historyDetailBox);
 
@@ -1119,6 +1129,7 @@ const envListBox = new BoxRenderable(renderer, {
   borderColor: C.dim,
   backgroundColor: C.bg,
   flexDirection: "column",
+  padding: 1,
 });
 envWindow.add(envListBox);
 
@@ -1141,18 +1152,60 @@ const envDetailBox = new BoxRenderable(renderer, {
   title: " ENVIRONMENT ",
   borderColor: C.dim,
   backgroundColor: C.bg,
+  padding: 1,
 });
 envWindow.add(envDetailBox);
 
 const envDetail = new TextareaRenderable(renderer, {
   backgroundColor: C.bg,
   textColor: C.fg,
-  width: "100%", height: "100%",
+  flexGrow: 1, flexBasis: 0, height: "100%",
   selectable: true,
 });
-envDetailBox.add(envDetail);
+const envDetailGutter = new TextRenderable(renderer, {
+  content: "", width: 3, height: "100%", flexShrink: 0, fg: C.dim, bg: C.bg, selectable: false,
+} as any);
+const envDetailWrap = new BoxRenderable(renderer, { flexDirection: "row", width: "100%", flexGrow: 1, flexBasis: 0 });
+envDetailWrap.add(envDetailGutter);
+envDetailWrap.add(envDetail);
+envDetailBox.add(envDetailWrap);
 envWindow.visible = false;
 root.add(statusBar);
+
+const commandLines: { box: BoxRenderable; line: TextRenderable }[] = [];
+
+function createCommandLine(box: BoxRenderable): { box: BoxRenderable; line: TextRenderable } {
+  const line = new TextRenderable(renderer, {
+    content: "", position: "absolute", left: 0, bottom: 0, width: 10, height: 1,
+    fg: C.fg, bg: C.panel, selectable: false, visible: false, zIndex: 10,
+  } as any);
+  box.add(line);
+  const entry = { box, line };
+  commandLines.push(entry);
+  return entry;
+}
+
+const editorCommandLine = createCommandLine(editorBox);
+const envDetailCommandLine = createCommandLine(envDetailBox);
+
+function commandLineTarget(): { box: BoxRenderable; line: TextRenderable } | null {
+  if (appWindow === "environments") return envPane === "editor" ? envDetailCommandLine : null;
+  if (appWindow === "workspace" && pane === "editor") return editorCommandLine;
+  return null;
+}
+
+function renderCommandLine() {
+  for (const { box, line } of commandLines) {
+    line.visible = false;
+    const width = Math.max(1, Math.floor(box.width) - 2);
+    if (line.width !== width) line.width = width;
+  }
+  if (commandBuffer === null) return;
+  const target = commandLineTarget();
+  if (!target) return;
+  target.line.content = `:${commandBuffer}`.padEnd(Math.max(1, Math.floor(target.box.width) - 2));
+  target.line.visible = true;
+}
 
 const helpBackdrop = new BoxRenderable(renderer, {
   position: "absolute", top: 0, left: 0, width: "100%", height: "100%",
@@ -1929,6 +1982,11 @@ function applyPalette() {
   renderer.setBackgroundColor(C.bg);
   tabBar.bg = C.panel;
   statusBar.bg = C.panel;
+  for (const { line } of commandLines) { line.fg = C.fg; line.bg = C.panel; }
+  editorGutter.fg = C.dim;
+  editorGutter.bg = C.bg;
+  envDetailGutter.fg = C.dim;
+  envDetailGutter.bg = C.bg;
   listBox.backgroundColor = C.bg;
   verticalDivider.backgroundColor = C.bg;
   filterInput.textColor = C.fg;
@@ -2084,14 +2142,48 @@ function ensureCursorVisible(target: TextareaRenderable) {
   if (offsetY !== viewport.offsetY) view.setViewport(viewport.offsetX, offsetY, viewport.width, viewport.height, false);
 }
 
+const gutterState = new WeakMap<TextRenderable, { width: number; content: string }>();
+
+function renderGutter(target: TextareaRenderable, gutter: TextRenderable) {
+  const view = target.editorView;
+  const viewport = view.getViewport();
+  const height = Math.min(viewport.height, gutter.height);
+  if (height <= 0) return;
+  const sources = view.getLogicalLineInfo().lineSources;
+  const digits = String(Math.max(1, target.editBuffer.getLineCount())).length;
+  const width = digits + 2;
+  const rows: string[] = [];
+  let prevLogical = -1;
+  for (let i = 0; i < height; i++) {
+    const logical = sources[viewport.offsetY + i];
+    if (logical === undefined) {
+      rows.push(` ${"~".padEnd(digits)} `);
+      prevLogical = -1;
+    } else if (logical === prevLogical) {
+      rows.push(" ".repeat(width));
+    } else {
+      prevLogical = logical;
+      rows.push(` ${String(logical + 1).padStart(digits)} `);
+    }
+  }
+  const content = rows.join("\n");
+  const state = gutterState.get(gutter) ?? { width: 0, content: "" };
+  if (state.width !== width) { gutter.width = width; state.width = width; }
+  if (state.content !== content) { gutter.content = content; state.content = content; }
+  gutterState.set(gutter, state);
+}
+
+function refreshGutters() {
+  renderGutter(editor, editorGutter);
+  renderGutter(envDetail, envDetailGutter);
+}
+
 function setStatus() {
   renderTabs();
+  refreshGutters();
+  renderCommandLine();
   const dirtyInfos = dirtyBufferInfos();
   statusBar.fg = dirtyInfos.length > 0 ? C.yellow : C.fg;
-  if (commandBuffer !== null) {
-    statusBar.content = `:${commandBuffer}`;
-    return;
-  }
   const mode = appWindow === "history" ? (historyPane === "detail" ? (visual ? "VISUAL" : "RUN-DETAILS") : "HISTORY") : appWindow === "environments" ? (envInsert ? "ENV-INSERT" : envPane === "editor" ? "ENV-NORMAL" : "ENVIRONMENTS") : pane === "editor"
     ? (insert ? "INSERT" : visual ? "REQ-VISUAL" : "REQ-NORMAL")
     : pane === "response" && visual ? "VISUAL" : pane.toUpperCase();
@@ -2468,18 +2560,55 @@ function enterCommandLine() {
   setStatus();
 }
 
+type ParsedCommand = { write: boolean; quit: boolean; all: boolean; force: boolean };
+
+function parseCommandLine(c: string): ParsedCommand | null {
+  const match = c.match(/^([wqxa]+)(!)?$/);
+  if (!match) return null;
+  const letters = match[1];
+  if (/(.).*\1/.test(letters)) return null;
+  const write = letters.includes("w") || letters.includes("x");
+  const quit = letters.includes("q") || letters.includes("x");
+  const all = letters.includes("a");
+  if (all && !write && !quit) return null;
+  return { write, quit, all, force: Boolean(match[2]) };
+}
+
 function runCommandLine(cmd: string) {
   const c = cmd.trim();
+  if (c === "") return;
+  const parsed = parseCommandLine(c);
+  if (!parsed) {
+    statusMsg = `not an editor command: ${c}`;
+    setStatus();
+    return;
+  }
+  const { write, quit, all, force } = parsed;
   const inEnvWindow = appWindow === "environments";
   const inEnvEditor = inEnvWindow && envPane === "editor";
   const inReqEditor = appWindow === "workspace" && pane === "editor";
-  if (c === "") return;
-  if (c === "w") {
+  if (all) {
+    if (write) {
+      if (editorDirty()) saveEditor();
+      if (envDirty()) saveEnvironmentFile();
+    }
+    if (quit) {
+      const dirtyName = dirtyBufferName();
+      if (dirtyName && !force) {
+        focusDirtyBuffer(dirtyName);
+        return;
+      }
+      renderer.destroy();
+      process.exit(0);
+    }
+    return;
+  }
+  if (write && !quit) {
     if (inEnvWindow) saveEnvironmentFile();
     else saveEditor();
     return;
   }
-  if (c === "wq" || c === "x") {
+  if (write && quit) {
     if (inEnvEditor) {
       saveEnvironmentFile();
       setEnvPane("list");
@@ -2494,39 +2623,34 @@ function runCommandLine(cmd: string) {
     }
     return;
   }
-  if (c === "q" || c === "q!") {
-    const force = c === "q!";
-    if (inEnvEditor) {
-      if (envDirty() && !force) {
-        statusMsg = "no write since last change (add ! to override)";
-        setStatus();
-        return;
-      }
-      if (envDirty()) loadEnvironmentFile(true);
-      setEnvPane("list");
+  if (inEnvEditor) {
+    if (envDirty() && !force) {
+      statusMsg = "no write since last change (add ! to override)";
+      setStatus();
       return;
     }
-    if (inReqEditor) {
-      if (editorDirty() && !force) {
-        statusMsg = "no write since last change (add ! to override)";
-        setStatus();
-        return;
-      }
-      const req = currentReq();
-      if (editorDirty() && req) loadEditorEntry(req, true);
-      setPane("list");
-      return;
-    }
-    const dirtyName = dirtyBufferName();
-    if (dirtyName && !force) {
-      focusDirtyBuffer(dirtyName);
-      return;
-    }
-    renderer.destroy();
-    process.exit(0);
+    if (envDirty()) loadEnvironmentFile(true);
+    setEnvPane("list");
+    return;
   }
-  statusMsg = `not an editor command: ${c}`;
-  setStatus();
+  if (inReqEditor) {
+    if (editorDirty() && !force) {
+      statusMsg = "no write since last change (add ! to override)";
+      setStatus();
+      return;
+    }
+    const req = currentReq();
+    if (editorDirty() && req) loadEditorEntry(req, true);
+    setPane("list");
+    return;
+  }
+  const dirtyName = dirtyBufferName();
+  if (dirtyName && !force) {
+    focusDirtyBuffer(dirtyName);
+    return;
+  }
+  renderer.destroy();
+  process.exit(0);
 }
 
 const VIM_MOVE: [string, string][] = [
@@ -2568,7 +2692,6 @@ const PANE_HELP: Record<string, [string, string][]> = {
     ["ctrl-x", "delete request"],
     ["ctrl-p", "cycle environment"],
     ["alt+hjkl / alt-0", "resize panes / reset"],
-    [":q / :q!", "quit (bang discards unsaved changes)"],
     ["q", "quit"],
   ],
   editor: [
@@ -2578,6 +2701,7 @@ const PANE_HELP: Record<string, [string, string][]> = {
     ["ctrl-s / :w", "save"],
     [":wq / :x", "save and close pane"],
     [":q / :q!", "close pane (bang discards changes)"],
+    [":wa / :qa / :wqa", "save all / quit all / save all and quit"],
     ["ctrl-l / ctrl-h", "next pane (response) / prev pane (list)"],
     ["alt+hjkl / alt-0", "resize panes / reset"],
     ["esc", "leave insert / cancel visual / back to list"],
@@ -2627,6 +2751,7 @@ const PANE_HELP: Record<string, [string, string][]> = {
     ["ctrl-s / :w", "save"],
     [":wq / :x", "save and close pane"],
     [":q / :q!", "close pane (bang discards changes)"],
+    [":wa / :qa / :wqa", "save all / quit all / save all and quit"],
     ["alt+hl / alt-0", "resize sidebar / reset"],
     ["ctrl-h", "back to list"],
     ["esc", "leave insert / cancel visual / back to list"],
@@ -2731,7 +2856,6 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
     }
     if (key.ctrl && k === "l") { setEnvPane("editor"); key.preventDefault(); return; }
     if (k === "l") { setEnvPane("editor"); key.preventDefault(); return; }
-    if (k === ":" || (k === ";" && key.shift)) { enterCommandLine(); key.preventDefault(); return; }
     if (k === "escape" || k === "1") { setWindow("workspace"); key.preventDefault(); return; }
     if (k === "j") {
       const next = Math.min(environments.length - 1, selectedEnvironment + 1);
@@ -2833,7 +2957,6 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
   if (pane === "list") {
     if (filterInputFocused()) return;
     if (k === "/" ) { filterInput.focus(); key.preventDefault(); return; }
-    if (k === ":" || (k === ";" && key.shift)) { enterCommandLine(); key.preventDefault(); return; }
     if (listPending) {
       const pendingList = listPending;
       listPending = null;
@@ -2986,4 +3109,19 @@ setWindow("workspace");
 setPane("list");
 watchCollection();
 watchOmarchyTheme();
+let snapEditorHeight = true;
+renderer.on("frame" as any, () => {
+  if (snapEditorHeight && editorBox.height > 0) {
+    snapEditorHeight = false;
+    editorBox.height = Math.round(editorBox.height);
+  }
+  refreshGutters();
+  renderCommandLine();
+});
+renderer.on("resize" as any, () => {
+  editorBox.height = `${editorSplit}%`;
+  snapEditorHeight = true;
+  refreshGutters();
+  renderCommandLine();
+});
 renderer.start();
