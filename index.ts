@@ -1213,6 +1213,9 @@ let environmentSplit = 32;
 let flowSplit = 36;
 let flowDetailSplit = 55;
 
+type DividerDrag = { divider: BoxRenderable; container: BoxRenderable; axis: "x" | "y"; resize: (value: number) => void };
+let activeDivider: DividerDrag | null = null;
+
 const listBox = new BoxRenderable(renderer, {
   width: `${sidebarSplit}%`, flexShrink: 0, border: true, borderStyle: "single", title: " REQUESTS ", flexDirection: "column",
   borderColor: C.dim, backgroundColor: C.bg,
@@ -1645,57 +1648,72 @@ function setFixedSidebarSplit(value: number, container: BoxRenderable, sidebar: 
   renderer.requestRender();
 }
 
-const showDivider = (divider: BoxRenderable) => { divider.backgroundColor = C.dim; };
-const hideDivider = (divider: BoxRenderable) => { divider.backgroundColor = C.bg; };
+const POINTER_SHAPE: Record<"x" | "y", string> = { x: "ew-resize", y: "ns-resize" };
 
-function setupVerticalDivider(divider: BoxRenderable, container: BoxRenderable, resize: (width: number) => void) {
-  divider.onMouseOver = () => showDivider(divider);
-  divider.onMouseOut = () => hideDivider(divider);
-  divider.onMouseDrag = (event) => {
-    if (event.button !== 0) return;
-    showDivider(divider);
-    resize(event.x - container.screenX);
-    event.preventDefault();
-  };
-  divider.onMouseDragEnd = () => hideDivider(divider);
+function setPointerShape(shape: string) {
+  (renderer as any).writeOut(`\x1b]22;${shape}\x1b\\`);
 }
 
-setupVerticalDivider(verticalDivider, main, (width) => {
+const showDivider = (divider: BoxRenderable, axis: "x" | "y") => {
+  divider.backgroundColor = C.dim;
+  setPointerShape(POINTER_SHAPE[axis]);
+};
+const hideDivider = (divider: BoxRenderable) => {
+  divider.backgroundColor = C.bg;
+  setPointerShape("default");
+};
+
+function endDividerDrag() {
+  if (!activeDivider) return;
+  hideDivider(activeDivider.divider);
+  activeDivider = null;
+}
+
+function setupDivider(divider: BoxRenderable, container: BoxRenderable, axis: "x" | "y", resize: (value: number) => void) {
+  divider.onMouseOver = () => { if (!activeDivider) showDivider(divider, axis); };
+  divider.onMouseOut = () => { if (!activeDivider) hideDivider(divider); };
+  divider.onMouseDown = (event) => {
+    if (event.button !== 0) return;
+    activeDivider = { divider, container, axis, resize };
+    showDivider(divider, axis);
+    event.preventDefault();
+    event.stopPropagation();
+  };
+}
+
+setupDivider(verticalDivider, main, "x", (x) => {
   const available = Math.max(1, main.width - verticalDivider.width);
-  setSplits((width / available) * 100, editorSplit);
+  setSplits((x / available) * 100, editorSplit);
 });
 
-horizontalDivider.onMouseOver = () => showDivider(horizontalDivider);
-horizontalDivider.onMouseOut = () => hideDivider(horizontalDivider);
-horizontalDivider.onMouseDrag = (event) => {
-  if (event.button !== 0) return;
-  showDivider(horizontalDivider);
+setupDivider(historyDivider, historyWindow, "x", (x) => {
+  setFixedSidebarSplit(x, historyWindow, historyListBox);
+});
+setupDivider(environmentDivider, envWindow, "x", (x) => {
+  setFixedSidebarSplit(x, envWindow, envListBox);
+});
+setupDivider(flowDivider, flowWindow, "x", (x) => {
+  setFixedSidebarSplit(x, flowWindow, flowListBox);
+});
+
+setupDivider(horizontalDivider, rightCol, "y", (y) => {
   const height = Math.max(1, rightCol.height - horizontalDivider.height);
-  setSplits(sidebarSplit, ((event.y - rightCol.screenY) / height) * 100);
-  event.preventDefault();
-};
-horizontalDivider.onMouseDragEnd = () => hideDivider(horizontalDivider);
-
-flowHorizontalDivider.onMouseOver = () => showDivider(flowHorizontalDivider);
-flowHorizontalDivider.onMouseOut = () => hideDivider(flowHorizontalDivider);
-flowHorizontalDivider.onMouseDrag = (event) => {
-  if (event.button !== 0) return;
-  showDivider(flowHorizontalDivider);
+  setSplits(sidebarSplit, (y / height) * 100);
+});
+setupDivider(flowHorizontalDivider, flowRightCol, "y", (y) => {
   const height = Math.max(1, flowRightCol.height - flowHorizontalDivider.height);
-  setFlowDetailSplit(((event.y - flowRightCol.screenY) / height) * 100);
+  setFlowDetailSplit((y / height) * 100);
+});
+
+root.onMouseDrag = (event) => {
+  if (!activeDivider) return;
+  const { divider, container, axis, resize } = activeDivider;
+  showDivider(divider, axis);
+  resize(axis === "x" ? event.x - container.screenX : event.y - container.screenY);
   event.preventDefault();
 };
-flowHorizontalDivider.onMouseDragEnd = () => hideDivider(flowHorizontalDivider);
-
-setupVerticalDivider(historyDivider, historyWindow, (width) => {
-  setFixedSidebarSplit(width, historyWindow, historyListBox);
-});
-setupVerticalDivider(environmentDivider, envWindow, (width) => {
-  setFixedSidebarSplit(width, envWindow, envListBox);
-});
-setupVerticalDivider(flowDivider, flowWindow, (width) => {
-  setFixedSidebarSplit(width, flowWindow, flowListBox);
-});
+root.onMouseUp = () => endDividerDrag();
+root.onMouseDragEnd = () => endDividerDrag();
 
 function currentReq(): Req | null {
   const row = treeRows[selectedRow];
@@ -3459,6 +3477,7 @@ function setHistoryPane(next: HistoryPane) {
 
 function setWindow(next: AppWindow) {
   clearVisual();
+  endDividerDrag();
   filterInput.blur();
   commandBuffer = null;
   pendingDelete = null;
@@ -4518,4 +4537,5 @@ renderer.on("resize" as any, () => {
   refreshGutters();
   renderCommandLine();
 });
+renderer.on("blur" as any, () => endDividerDrag());
 renderer.start();

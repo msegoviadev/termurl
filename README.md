@@ -127,7 +127,10 @@ Useful controls:
 - `?`: show shortcuts for the current pane; `q`: quit.
 
 Mouse support includes pane focus, cursor positioning, row selection, folder
-expansion, double-click queue toggling, and drag selection in text areas.
+expansion, double-click queue toggling, drag selection in text areas, and
+dragging the pane dividers to resize (the highlighted bar also shows a
+horizontal/vertical resize cursor on terminals that support mouse pointer
+shapes).
 
 The response pane pretty-prints JSON and limits display to 2000 lines. The full
 body remains available through the `s` command. Assertion messages are reduced
