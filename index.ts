@@ -297,12 +297,31 @@ function parseEntries(src: string): Entry[] {
   });
 }
 
+type HurlFileCacheEntry = { mtimeMs: number; text: string; entries: Entry[] };
+const hurlFileCache = new Map<string, HurlFileCacheEntry>();
+const EMPTY_HURL_FILE: HurlFileCacheEntry = { mtimeMs: 0, text: "", entries: [] };
+
+// Reads and parses a .hurl file once per on-disk version; revalidated by mtime
+// so editor saves and external writes always serve fresh content.
+function readHurlFile(file: string): HurlFileCacheEntry {
+  try {
+    const mtimeMs = statSync(file).mtimeMs;
+    const cached = hurlFileCache.get(file);
+    if (cached && cached.mtimeMs === mtimeMs) return cached;
+    const text = readFileSync(file, "utf8");
+    const fresh: HurlFileCacheEntry = { mtimeMs, text, entries: parseEntries(text) };
+    hurlFileCache.set(file, fresh);
+    return fresh;
+  } catch {
+    return EMPTY_HURL_FILE;
+  }
+}
+
 function entrySource(req: Req, variant?: string): string {
-  let src = "";
-  try { src = readFileSync(req.file, "utf8"); } catch { return ""; }
-  const entries = parseEntries(src);
-  if (!variant) return entries[0]?.text ?? src;
-  return entries.find((entry) => entry.name === variant)?.text ?? entries[0]?.text ?? src;
+  const { text, entries } = readHurlFile(req.file);
+  if (entries.length === 0) return text;
+  if (!variant) return entries[0]?.text ?? text;
+  return entries.find((entry) => entry.name === variant)?.text ?? entries[0]?.text ?? text;
 }
 
 type RunTarget = { req: Req; variant?: string };
@@ -344,12 +363,18 @@ function environmentFile(name: string, collection = COLLECTION): string {
   return join(collection, `.env.${name}`);
 }
 
+const envVariablesCache = new Map<string, Record<string, string>>();
+
 function environmentVariables(name: string, collection = COLLECTION): Record<string, string> {
+  const cacheKey = `${collection}\0${name}`;
+  const cached = envVariablesCache.get(cacheKey);
+  if (cached) return cached;
+  let variables: Record<string, string> = {};
   try {
-    return parseVariables(readFileSync(environmentFile(name, collection), "utf8"));
-  } catch {
-    return {};
-  }
+    variables = parseVariables(readFileSync(environmentFile(name, collection), "utf8"));
+  } catch {}
+  envVariablesCache.set(cacheKey, variables);
+  return variables;
 }
 
 function activeVariables(): Record<string, string> {
@@ -876,10 +901,12 @@ if (!process.stdout.isTTY) {
 function copyToClipboard(renderer: any, text: string): string {
   let via = "osc52";
   const ok = renderer.copyToClipboardOSC52(text);
-  try {
-    Bun.spawnSync({ cmd: ["pbcopy"], stdin: new TextEncoder().encode(text) });
-    via = "pbcopy";
-  } catch {}
+  if (process.platform === "darwin") {
+    try {
+      Bun.spawnSync({ cmd: ["pbcopy"], stdin: new TextEncoder().encode(text) });
+      via = "pbcopy";
+    } catch {}
+  }
   return ok || via === "pbcopy" ? via : "failed";
 }
 
@@ -1330,12 +1357,12 @@ function dirtyBufferInfos(): { name: string; added: number; removed: number }[] 
   return infos;
 }
 
-function dirtyBufferName(): string | null {
-  return dirtyBufferInfos()[0]?.name ?? null;
+function dirtyBufferName(infos = dirtyBufferInfos()): string | null {
+  return infos[0]?.name ?? null;
 }
 
-function dirtyBufferLabel(): string {
-  return dirtyBufferInfos()
+function dirtyBufferLabel(infos = dirtyBufferInfos()): string {
+  return infos
     .map(({ name, added, removed }) => {
       const stats = [added > 0 ? `+${added}` : "", removed > 0 ? `-${removed}` : ""].filter(Boolean).join(" ");
       return `[${name}${stats ? ` ${stats}` : "+"}]`;
@@ -1482,10 +1509,25 @@ function applyResponseHighlights(target: TextareaRenderable, text: string, faile
   target.editBuffer.setSyntaxStyle(responseFailureSyntax);
   target.editBuffer.clearAllHighlights();
 
+  // Line start offsets, computed once; every range highlight below maps
+  // character offsets to rows from this table instead of re-splitting text.
+  const lineStarts: number[] = [0];
+  for (let i = text.indexOf("\n"); i >= 0; i = text.indexOf("\n", i + 1)) lineStarts.push(i + 1);
+  const lineAt = (offset: number): number => {
+    let low = 0;
+    let high = lineStarts.length;
+    while (low + 1 < high) {
+      const mid = (low + high) >> 1;
+      if (lineStarts[mid] <= offset) low = mid;
+      else high = mid;
+    }
+    return low;
+  };
+
   const highlightRange = (start: number, end: number, styleId: number) => {
-    let lineStart = 0;
-    for (const [line, content] of text.split("\n").entries()) {
-      const lineEnd = lineStart + content.length;
+    for (let line = lineAt(start); line < lineStarts.length && lineStarts[line] < end; line++) {
+      const lineStart = lineStarts[line];
+      const lineEnd = line + 1 < lineStarts.length ? lineStarts[line + 1] - 1 : text.length;
       const rangeStart = Math.max(start, lineStart);
       const rangeEnd = Math.min(end, lineEnd);
       if (rangeStart < rangeEnd) {
@@ -1495,7 +1537,6 @@ function applyResponseHighlights(target: TextareaRenderable, text: string, faile
           styleId,
         });
       }
-      lineStart = lineEnd + 1;
     }
   };
 
@@ -1512,10 +1553,13 @@ function applyResponseHighlights(target: TextareaRenderable, text: string, faile
 
   // Per-step heading in a multi-request flow (e.g. "▸ 2. notification-send-push"),
   // highlighted the same as section labels so it's not lost after a long response body.
-  let lineStart = 0;
-  for (const content of text.split("\n")) {
-    if (/^▸ \d+\.\s.+$/.test(content)) highlightRange(lineStart, lineStart + content.length, labelStyleId);
-    lineStart += content.length + 1;
+  for (let line = 0; line < lineStarts.length; line++) {
+    const lineStart = lineStarts[line];
+    const lineEnd = line + 1 < lineStarts.length ? lineStarts[line + 1] - 1 : text.length;
+    const content = text.slice(lineStart, lineEnd);
+    if (/^▸ \d+\.\s.+$/.test(content)) {
+      target.editBuffer.addHighlight(line, { start: 0, end: content.length, styleId: labelStyleId });
+    }
   }
 
   if (!failed) return;
@@ -1562,9 +1606,9 @@ function availableCaptures(req: Req | null): Set<string> {
   return available;
 }
 
-function variableSource(name: string, req: Req | null = currentReq(), environment = environments[environmentIdx]): VariableSource {
-  if (availableCaptures(req).has(name)) return "capture";
-  if (environmentVariables(environment)[name] !== undefined) return /^secret_/i.test(name) ? "secret" : "file";
+function variableSource(name: string, captures: Set<string>): VariableSource {
+  if (captures.has(name)) return "capture";
+  if (environmentVariables(environments[environmentIdx])[name] !== undefined) return /^secret_/i.test(name) ? "secret" : "file";
   return "unresolved";
 }
 
@@ -1649,6 +1693,7 @@ function saveEnvironmentFile() {
   envMasked = false;
   envLoadedName = name;
   writeFileSync(environmentFile(name), envDetail.plainText);
+  envVariablesCache.clear();
   statusMsg = `saved .env.${name}`;
   syncModeTitles();
   refreshEditorHighlights();
@@ -1689,16 +1734,19 @@ function setEnvPane(next: EnvPane) {
 function refreshEditorHighlights() {
   editor.editBuffer.setSyntaxStyle(variableSyntax);
   editor.editBuffer.clearAllHighlights();
-  const req = currentReq();
-  for (const match of editor.plainText.matchAll(/\{\{([a-z_][a-z0-9_]*)\}\}/g)) {
-    const start = match.index ?? 0;
-    const lineStart = editor.plainText.lastIndexOf("\n", start - 1) + 1;
-    const line = editor.plainText.slice(0, start).split("\n").length - 1;
-    const source = variableSource(match[1], req);
-    const styleId = variableSyntax.getStyleId(source) ?? 0;
+  const text = editor.plainText;
+  if (!text.includes("{{")) return;
+  const captures = availableCaptures(currentReq());
+  const lineStarts: number[] = [0];
+  for (let i = text.indexOf("\n"); i >= 0; i = text.indexOf("\n", i + 1)) lineStarts.push(i + 1);
+  let line = 0;
+  for (const match of text.matchAll(/\{\{([a-z_][a-z0-9_]*)\}\}/g)) {
+    const start = match.index;
+    while (line + 1 < lineStarts.length && lineStarts[line + 1] <= start) line++;
+    const styleId = variableSyntax.getStyleId(variableSource(match[1], captures)) ?? 0;
     editor.editBuffer.addHighlight(line, {
-      start: start - lineStart,
-      end: start - lineStart + match[0].length,
+      start: start - lineStarts[line],
+      end: start - lineStarts[line] + match[0].length,
       styleId,
     });
   }
@@ -1858,8 +1906,34 @@ function loadHistory() {
   if (appWindow === "history") renderHistory();
 }
 
+let liveHistoryKeyCounter = 0;
+
+// Applies a freshly appended record to the in-memory groups instead of
+// re-parsing the whole history.jsonl after every run. New records are always
+// the most recent, so a new group goes to the front of the desc-by-ts list.
+function appendHistoryRecord(record: HistoryRecord) {
+  const key = record.flow_id ?? `request-live-${liveHistoryKeyCounter++}`;
+  let group = historyGroups.find((candidate) => candidate.key === key);
+  if (!group) {
+    group = {
+      key,
+      flow: Boolean(record.flow_id || (record.flow_size ?? 0) > 1),
+      ts: record.ts,
+      environment: record.environment ?? record.profile ?? "-",
+      steps: [],
+    };
+    historyGroups.unshift(group);
+  }
+  group.steps.push(record);
+  group.steps.sort((a, b) => (a.step ?? 1) - (b.step ?? 1));
+  if (record.ts > group.ts) group.ts = record.ts;
+  selectedHistory = Math.max(0, Math.min(selectedHistory, Math.max(0, historyGroups.length - 1)));
+  if (appWindow === "history") renderHistory();
+}
+
 function recordHistory(target: RunTarget, result: RunResult, flowId?: string, step?: number, flowSize?: number) {
   mkdirSync(join(COLLECTION, ".termurl"), { recursive: true });
+  const requestDetail = formatRequest(result);
   const record: HistoryRecord = {
     ts: new Date().toISOString(),
     request: target.req.name,
@@ -1869,13 +1943,13 @@ function recordHistory(target: RunTarget, result: RunResult, flowId?: string, st
     success: result.success,
     duration_ms: result.ms,
     captures: result.captures,
-    ...(formatRequest(result) ? { request_detail: redactResponse(formatRequest(result)!) } : {}),
+    ...(requestDetail ? { request_detail: redactResponse(requestDetail) } : {}),
     response: redactResponse(formatRun(target.req, result, target.variant)),
     ...(result.error ? { error: result.error } : {}),
     ...(flowId ? { flow_id: flowId, step, flow_size: flowSize } : {}),
   };
   appendFileSync(HISTORY_FILE, `${JSON.stringify(record)}\n`);
-  loadHistory();
+  appendHistoryRecord(record);
 }
 
 function resolveKey(key: string): RunTarget | undefined {
@@ -2009,6 +2083,8 @@ function watchCollection() {
     watch(COLLECTION, { recursive: true }, () => {
       if (timer) clearTimeout(timer);
       timer = setTimeout(() => {
+        envVariablesCache.clear();
+        hurlFileCache.clear();
         requests.splice(0, requests.length, ...loadRequests());
         refreshList(undefined, appWindow === "workspace" && !insert && !editorDirty());
       }, 150);
@@ -2236,7 +2312,7 @@ function setStatus() {
   const last = [...lastResult.entries()].slice(-1)[0];
   statusBar.content =
     ` ${appWindow === "workspace" ? "1 WORKSPACE" : appWindow === "history" ? "2 HISTORY" : "3 ENVIRONMENTS"} · ${mode}` +
-    (dirtyInfos.length > 0 ? ` ${dirtyBufferLabel()}` : "") +
+    (dirtyInfos.length > 0 ? ` ${dirtyBufferLabel(dirtyInfos)}` : "") +
     ` · env: ${environments[environmentIdx]} · queued: ${flowQueue.size}` +
     (last ? ` · last: ${last[0]} ${last[1] === "ok" ? "✓" : "✗"}` : "") +
     (statusMsg ? ` · ${statusMsg}` : "") +
