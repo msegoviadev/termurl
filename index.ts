@@ -1159,6 +1159,8 @@ type HistoryRecord = {
   flow_id?: string;
   step?: number;
   flow_size?: number;
+  flow?: string;
+  queued?: boolean;
   captures?: string[];
   request_detail?: string;
   response?: string;
@@ -1168,6 +1170,8 @@ type HistoryRecord = {
 type HistoryGroup = {
   key: string;
   flow: boolean;
+  flowName?: string;
+  queued: boolean;
   ts: string;
   environment: string;
   steps: HistoryRecord[];
@@ -2629,10 +2633,14 @@ function historyTitle(group: HistoryGroup, selected: boolean): StyledText {
   const base = fg(selected ? C.fg : C.dim);
   const status = fg(historyFailed(group) ? C.red : C.green);
   const time = historyTime(group.ts);
-  if (group.flow) return t`${base(`${time}  FLOW  ${group.steps.length} steps  `)}${status(historyStatus(group))}`;
+  if (group.flow) {
+    const kind = group.flowName ? `FLOW  ${group.flowName}` : group.queued ? "QUEUE" : "FLOW";
+    const steps = `${group.steps.length} step${group.steps.length === 1 ? "" : "s"}`;
+    return t`${base(`${time}  ${kind}  (${steps})  `)}${status(historyStatus(group))}`;
+  }
   const step = group.steps[0];
   const request = step ? targetKeyLabel(step) : "unknown";
-  return t`${base(`${time}  ${request}  `)}${status(historyStatus(group))}`;
+  return t`${base(`${time}  REQUEST  ${request}  `)}${status(historyStatus(group))}`;
 }
 
 function targetKeyLabel(step: HistoryRecord): string {
@@ -2642,8 +2650,12 @@ function targetKeyLabel(step: HistoryRecord): string {
 function historyDetailText(group: HistoryGroup | undefined): string {
   if (!group) return "No runs recorded yet.";
   const duration = group.steps.reduce((sum, step) => sum + step.duration_ms, 0);
+  const first = group.steps[0];
+  const kind = group.flow
+    ? group.flowName ? `FLOW ${group.flowName}` : group.queued ? "QUEUE" : "FLOW"
+    : `REQUEST ${first ? targetKeyLabel(first) : "unknown"}`;
   const lines = [
-    `${group.flow ? "FLOW" : "REQUEST"} · ${group.environment}`,
+    `${kind} · ${group.environment}`,
     `started: ${group.ts}`,
     `duration: ${duration}ms · status: ${historyStatus(group)}`,
     "",
@@ -2704,6 +2716,8 @@ function newHistoryGroup(key: string, record: HistoryRecord): HistoryGroup {
   return {
     key,
     flow: Boolean(record.flow_id || (record.flow_size ?? 0) > 1),
+    flowName: record.flow,
+    queued: Boolean(record.queued),
     ts: record.ts,
     environment: record.environment ?? record.profile ?? "-",
     steps: [],
@@ -2762,7 +2776,7 @@ function appendHistoryRecord(record: HistoryRecord) {
   if (appWindow === "history") renderHistory();
 }
 
-function recordHistory(target: RunTarget, result: RunResult, flowId?: string, step?: number, flowSize?: number) {
+function recordHistory(target: RunTarget, result: RunResult, meta: { flowId?: string; step?: number; flowSize?: number; flow?: string; queued?: boolean } = {}) {
   mkdirSync(join(COLLECTION, ".termurl"), { recursive: true });
   const requestDetail = formatRequest(result);
   const record: HistoryRecord = {
@@ -2777,7 +2791,9 @@ function recordHistory(target: RunTarget, result: RunResult, flowId?: string, st
     ...(requestDetail ? { request_detail: redactResponse(requestDetail) } : {}),
     response: redactResponse(formatRun(result, target.variant)),
     ...(result.error ? { error: result.error } : {}),
-    ...(flowId ? { flow_id: flowId, step, flow_size: flowSize } : {}),
+    ...(meta.flowId ? { flow_id: meta.flowId, step: meta.step, flow_size: meta.flowSize } : {}),
+    ...(meta.flow ? { flow: meta.flow } : {}),
+    ...(meta.queued ? { queued: true } : {}),
   };
   appendFileSync(HISTORY_FILE, `${JSON.stringify(record)}\n`);
   appendHistoryRecord(record);
@@ -3597,7 +3613,7 @@ function formatFlowResponse(targets: RunTarget[], results: RunResult[], label: s
   return `${label} (env: ${environments[environmentIdx]}), ${targets.length} requests\n\n` + parts.join(`\n\n${"─".repeat(60)}\n\n`);
 }
 
-async function runFlowTargets(targets: RunTarget[], label: string, surface: RunSurface = "requests") {
+async function runFlowTargets(targets: RunTarget[], label: string, surface: RunSurface = "requests", flowName?: string) {
   statusMsg = `running flow (${targets.length} requests)`;
   setStatus();
   const results = await runHurl(targets);
@@ -3605,7 +3621,7 @@ async function runFlowTargets(targets: RunTarget[], label: string, surface: RunS
   const flowId = `flow-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   targets.forEach((target, index) => {
     const r = results[index] ?? emptyRunResult("Hurl did not return a result for this step");
-    recordHistory(target, r, flowId, index + 1, targets.length);
+    recordHistory(target, r, { flowId, step: index + 1, flowSize: targets.length, flow: flowName, queued: !flowName });
   });
   const text = formatFlowResponse(targets, results, label);
   const failed = results.some((result) => !result.success);
@@ -3637,7 +3653,7 @@ async function runNamedFlow(flow: Flow, surface: RunSurface = "requests") {
     setStatus();
     return;
   }
-  await runFlowTargets(resolved.targets ?? [], `flow ${flow.name}`, surface);
+  await runFlowTargets(resolved.targets ?? [], `flow ${flow.name}`, surface, flow.name);
 }
 
 function enterInsert() {

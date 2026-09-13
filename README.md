@@ -393,6 +393,21 @@ renames, and `d` deletes. Names are relative to `requests/`, so `a` with `specs/
 creates a folder and `specs/get` creates `requests/specs/get.hurl`. Renaming or deleting
 a request rewrites the corresponding step lines in every `.flow` file.
 
+## History
+
+The **History tab** (`3`) lists recent runs, newest first, grouped by day. Each
+row shows the kind, the name, the flow step count, and the status:
+
+```text
+14:32  REQUEST  httpbin/get  OK
+14:31  FLOW  register-a-user  (3 steps)  OK
+14:30  QUEUE  (2 steps)  404 FAIL
+```
+
+An ad-hoc `tab` queue is shown as `QUEUE`; a saved flow shows its name. The
+detail pane repeats the kind and name and lists every step with its status,
+duration, captures, request, and response. History is stored in
+`.termurl/history.jsonl` and is not committed.
 
 ## Development
 
