@@ -191,8 +191,8 @@ termurl env list --json
 termurl env show prod --json
 ```
 
-Values from the shared `.env` file are masked by default. Use `--reveal` only
-when exposing a secret is intentional.
+Keys prefixed with `secret_` are masked by default. Use `--reveal` only when
+exposing a secret is intentional.
 
 ### Run
 
@@ -253,7 +253,7 @@ file:
 my-apis/
   .env.dev
   .env.prod
-  .env                 # shared secrets, ignored by Git
+  .env.example         # template, skipped by environment discovery
   specs/
     get.hurl
     list.hurl
@@ -264,10 +264,11 @@ comment becomes its description. Ordered flows are currently supplied as
 explicit request arguments; a first-class ordered collection format can be
 added later without changing individual request files.
 
-Environments use `.env.<name>` files. Shared secrets use a plain `.env`, which
-is not an environment. Variables are parsed as simple `KEY=value` lines.
-Variable precedence is captures, then shared `.env` values, then the selected
-environment file.
+Environments use `.env.<name>` files. Variables are parsed as simple
+`KEY=value` lines. Keys prefixed with `secret_` are masked in the TUI (toggle
+with `ctrl-r`) and in `termurl env show` unless `--reveal` is used. Variable
+precedence is captures, then `--var` values, then the selected environment
+file.
 
 ### Variants
 

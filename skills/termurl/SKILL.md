@@ -21,8 +21,8 @@ newer, must be on `PATH`.
 - `termurl show <request>` prints the raw hurl file. Append `@variant` to print
   only that entry, e.g. `termurl show specs/get@bad-payload`.
 - `termurl env list --json` lists available environments.
-- `termurl env show <name>` displays environment variables. Shared `.env`
-  secrets are masked unless `--reveal` is explicitly used.
+- `termurl env show <name>` displays environment variables. Keys prefixed with
+  `secret_` are masked unless `--reveal` is explicitly used.
 
 Request names are the collection-relative path without `.hurl`, for example
 `specs/get`. A `.hurl` suffix is also accepted. Run requests explicitly, never

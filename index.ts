@@ -52,7 +52,7 @@ function scaffoldCollection(dir: string) {
   if (existsSync(dir) && readdirSync(dir).length > 0) return;
   mkdirSync(join(dir, "httpbin"), { recursive: true });
   writeFileSync(join(dir, ".env.dev"), "# dev environment variables\nhost=https://httpbin.org\n");
-  writeFileSync(join(dir, ".env.example"), "# Shared secrets for all environments (copy to .env, keep it out of version control)\n# token=secret-value\n");
+  writeFileSync(join(dir, ".env.example"), "# Example environment file. Copy to .env.dev or another .env.<name>.\n# Keys prefixed with secret_ are masked until explicitly revealed.\n# secret_token=change-me\n");
   writeFileSync(join(dir, "httpbin", "get.hurl"), "# Sample request\nGET {{host}}/get\nHTTP 200\n");
 }
 
@@ -125,7 +125,10 @@ if (args[0] === "version" || hasFlag("--version")) {
 }
 
 const isDoctor = args[0] === "doctor";
-if (!HEADLESS_COMMANDS.has(args[0] ?? "") && (args.includes("--env") || args.some((arg) => arg.startsWith("--env=")) || args.includes("--json") || args.includes("--var") || args.some((arg) => arg.startsWith("--var=")) || args.includes("--variant") || args.some((arg) => arg.startsWith("--variant=")))) {
+const VALUE_OPTIONS = ["--env", "--var", "--variant"];
+const BOOLEAN_OPTIONS = ["--json", "--reveal", "--quiet", "-q"];
+const hasOption = (values: string[], name: string) => values.some((value) => value === name || value.startsWith(`${name}=`));
+if (!HEADLESS_COMMANDS.has(args[0] ?? "") && [...VALUE_OPTIONS, "--json"].some((name) => hasOption(args, name))) {
   console.error(`termurl: did you mean \`termurl run ${args.join(" ")}\`?`);
   process.exit(1);
 }
@@ -149,7 +152,9 @@ if (!isDoctor && (!existsSync(COLLECTION) || !statSync(COLLECTION).isDirectory()
 }
 const HISTORY_FILE = join(COLLECTION, ".termurl/history.jsonl");
 
-const REQUEST_LINE = /^(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS) \S+/;
+const HTTP_METHODS = "GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS";
+const REQUEST_LINE = new RegExp(`^(?:${HTTP_METHODS}) \\S+`);
+const REQUEST_CAPTURE = new RegExp(`^(${HTTP_METHODS})\\s+(\\S+)`, "m");
 const VARIANT_MARKER = /^#\s*variant:\s*(.+?)\s*$/;
 
 const requests = loadRequests();
@@ -240,7 +245,7 @@ function loadRequests(collection = COLLECTION): Req[] {
       const src = readFileSync(file, "utf8");
       const name = relative(collection, file).replace(/\.hurl$/, "");
       const desc = src.match(/^# (.+)$/m)?.[1] ?? "";
-      const reqLine = src.match(/^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS) (\S+)/m);
+      const reqLine = src.match(REQUEST_CAPTURE);
       const method = reqLine?.[1] ?? "?";
       const path = (reqLine?.[2] ?? "").replace("{{host}}", "");
       const vars = [...new Set([...src.matchAll(/\{\{([a-z_]+)\}\}/g)].map((m) => m[1]).filter((v) => v !== "host"))];
@@ -398,7 +403,7 @@ function renderCurl(source: string): string | undefined {
   const lines = source.split(/\r?\n/);
   let i = 0;
   while (i < lines.length && (lines[i].trim() === "" || lines[i].trim().startsWith("#"))) i++;
-  const reqLine = lines[i]?.match(/^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(\S+)/);
+  const reqLine = lines[i]?.match(REQUEST_CAPTURE);
   if (!reqLine) return undefined;
   const [, method, url] = reqLine;
   i++;
@@ -621,11 +626,11 @@ function positionalArgs(values: string[]): string[] {
   const positional: string[] = [];
   for (let index = 0; index < values.length; index += 1) {
     const value = values[index];
-    if (value === "--env" || value === "--var" || value === "--variant") {
+    if (VALUE_OPTIONS.includes(value)) {
       index += 1;
       continue;
     }
-    if (value.startsWith("--env=") || value.startsWith("--var=") || value.startsWith("--variant=") || value === "--json" || value === "--reveal" || value === "--quiet" || value === "-q") continue;
+    if (BOOLEAN_OPTIONS.includes(value) || VALUE_OPTIONS.some((name) => value.startsWith(`${name}=`))) continue;
     if (!value.startsWith("-")) positional.push(value);
   }
   return positional;
@@ -739,15 +744,11 @@ function envShowCommand(name: string | undefined, reveal: boolean, json: boolean
     console.error(`available environments: ${names.join(", ") || "none"}`);
     return 1;
   }
-  const values = new Map<string, { value: string; source: string; secret: boolean }>();
-  for (const [key, value] of Object.entries(environmentVariables(name))) values.set(key, { value, source: `.env.${name}`, secret: /^secret_/i.test(key) });
-  const variables = [...values.entries()].map(([key, item]) => ({
-    key,
-    value: item.secret && !reveal ? "***" : item.value,
-    source: item.source,
-    secret: item.secret,
-    masked: item.secret && !reveal,
-  }));
+  const variables = Object.entries(environmentVariables(name)).map(([key, value]) => {
+    const secret = /^secret_/i.test(key);
+    const masked = secret && !reveal;
+    return { key, value: masked ? "***" : value, source: `.env.${name}`, secret, masked };
+  });
   if (json) {
     console.log(JSON.stringify({ environment: name, variables }, null, 2));
     return 0;
@@ -986,7 +987,6 @@ const collapsed = new Set<string>();
 let treeRows: TreeRow[] = [];
 let selectedRow = 0;
 let lastRowClick = { index: -1, time: 0 };
-let listPending: string | null = null;
 
 function requestLabel(r: Req): string {
   const variant = currentVariant(r);
@@ -1398,6 +1398,16 @@ function focusDirtyBuffer(name: string) {
   setStatus();
 }
 
+function quitApp(force = false) {
+  const dirtyName = dirtyBufferName();
+  if (dirtyName && !force) {
+    focusDirtyBuffer(dirtyName);
+    return;
+  }
+  renderer.destroy();
+  process.exit(0);
+}
+
 function requestTitle(insertMode = false, visualMode = false): string {
   const req = currentReq();
   const variant = req ? currentVariant(req) : undefined;
@@ -1455,11 +1465,15 @@ function cycleVariant(delta: number) {
   setVariant(req, options[(index + delta + options.length) % options.length]);
 }
 
-function renderVariantStrip(req: Req | null) {
-  for (const child of variantStrip.getChildren()) {
-    variantStrip.remove(child);
+function clearChildren(container: BoxRenderable) {
+  for (const child of container.getChildren()) {
+    container.remove(child);
     child.destroy();
   }
+}
+
+function renderVariantStrip(req: Req | null) {
+  clearChildren(variantStrip);
   const show = Boolean(req && req.variants.length > 0);
   variantStrip.visible = show;
   if (!req || !show) return;
@@ -1486,6 +1500,12 @@ function renderVariantStrip(req: Req | null) {
 
 type VariableSource = "file" | "secret" | "capture" | "unresolved";
 
+function computeLineStarts(text: string): number[] {
+  const starts = [0];
+  for (let i = text.indexOf("\n"); i >= 0; i = text.indexOf("\n", i + 1)) starts.push(i + 1);
+  return starts;
+}
+
 function buildVariableSyntax(): SyntaxStyle {
   return SyntaxStyle.fromStyles({
     file: { fg: C.green },
@@ -1511,8 +1531,7 @@ function applyResponseHighlights(target: TextareaRenderable, text: string, faile
 
   // Line start offsets, computed once; every range highlight below maps
   // character offsets to rows from this table instead of re-splitting text.
-  const lineStarts: number[] = [0];
-  for (let i = text.indexOf("\n"); i >= 0; i = text.indexOf("\n", i + 1)) lineStarts.push(i + 1);
+  const lineStarts = computeLineStarts(text);
   const lineAt = (offset: number): number => {
     let low = 0;
     let high = lineStarts.length;
@@ -1637,10 +1656,7 @@ function maskSecretsText(text: string): string {
 }
 
 function renderEnvironments() {
-  for (const child of envList.getChildren()) {
-    envList.remove(child);
-    child.destroy();
-  }
+  clearChildren(envList);
   environments.forEach((environment, index) => {
     const active = index === environmentIdx;
     const selected = index === selectedEnvironment;
@@ -1722,8 +1738,7 @@ function setEnvPane(next: EnvPane) {
   commandBuffer = null;
   envInsert = false;
   envPane = next;
-  envListBox.borderColor = next === "list" ? C.yellow : C.dim;
-  envDetailBox.borderColor = next === "editor" ? C.yellow : C.dim;
+  refreshPaneBorders();
   loadEnvironmentFile();
   envDetailBox.title = envTitle(next);
   if (next === "editor") envDetail.focus();
@@ -1737,8 +1752,7 @@ function refreshEditorHighlights() {
   const text = editor.plainText;
   if (!text.includes("{{")) return;
   const captures = availableCaptures(currentReq());
-  const lineStarts: number[] = [0];
-  for (let i = text.indexOf("\n"); i >= 0; i = text.indexOf("\n", i + 1)) lineStarts.push(i + 1);
+  const lineStarts = computeLineStarts(text);
   let line = 0;
   for (const match of text.matchAll(/\{\{([a-z_][a-z0-9_]*)\}\}/g)) {
     const start = match.index;
@@ -1758,13 +1772,15 @@ function redactResponse(response: string): string {
     .replace(/(Bearer\s+)\S+/g, "$1<redacted>");
 }
 
+const stepFailed = (step: HistoryRecord) => step.success === false || step.status >= 400;
+
 function historyStatus(group: HistoryGroup): string {
-  const failed = group.steps.find((step) => step.success === false || step.status >= 400);
+  const failed = group.steps.find(stepFailed);
   return failed ? `${failed.status} FAIL` : "OK";
 }
 
 function historyFailed(group: HistoryGroup): boolean {
-  return group.steps.some((step) => step.success === false || step.status >= 400);
+  return group.steps.some(stepFailed);
 }
 
 function historyTime(ts: string): string {
@@ -1826,10 +1842,7 @@ function historyDetailText(group: HistoryGroup | undefined): string {
 }
 
 function renderHistory() {
-  for (const child of historyList.getChildren()) {
-    historyList.remove(child);
-    child.destroy();
-  }
+  clearChildren(historyList);
   let lastDayKey = "";
   historyGroups.forEach((group, index) => {
     const dayKey = historyDayKey(group.ts);
@@ -1869,6 +1882,18 @@ function renderHistory() {
   applyResponseHighlights(historyDetail, text, Boolean(group?.steps.some((step) => step.error || step.status >= 400)));
 }
 
+function newHistoryGroup(key: string, record: HistoryRecord): HistoryGroup {
+  return {
+    key,
+    flow: Boolean(record.flow_id || (record.flow_size ?? 0) > 1),
+    ts: record.ts,
+    environment: record.environment ?? record.profile ?? "-",
+    steps: [],
+  };
+}
+
+const byStep = (a: HistoryRecord, b: HistoryRecord) => (a.step ?? 1) - (b.step ?? 1);
+
 function loadHistory() {
   let records: HistoryRecord[] = [];
   try {
@@ -1883,13 +1908,7 @@ function loadHistory() {
     const key = record.flow_id ?? `request-${index}`;
     let group = groups.get(key);
     if (!group) {
-      group = {
-        key,
-        flow: Boolean(record.flow_id || record.flow_size && record.flow_size > 1),
-        ts: record.ts,
-        environment: record.environment ?? record.profile ?? "-",
-        steps: [],
-      };
+      group = newHistoryGroup(key, record);
       groups.set(key, group);
     }
     group.steps.push(record);
@@ -1899,7 +1918,7 @@ function loadHistory() {
   historyGroups = [...groups.values()]
     .map((group) => ({
       ...group,
-      steps: [...group.steps].sort((a, b) => (a.step ?? 1) - (b.step ?? 1)),
+      steps: [...group.steps].sort(byStep),
     }))
     .sort((a, b) => b.ts.localeCompare(a.ts));
   selectedHistory = Math.max(0, Math.min(selectedHistory, Math.max(0, historyGroups.length - 1)));
@@ -1915,17 +1934,11 @@ function appendHistoryRecord(record: HistoryRecord) {
   const key = record.flow_id ?? `request-live-${liveHistoryKeyCounter++}`;
   let group = historyGroups.find((candidate) => candidate.key === key);
   if (!group) {
-    group = {
-      key,
-      flow: Boolean(record.flow_id || (record.flow_size ?? 0) > 1),
-      ts: record.ts,
-      environment: record.environment ?? record.profile ?? "-",
-      steps: [],
-    };
+    group = newHistoryGroup(key, record);
     historyGroups.unshift(group);
   }
   group.steps.push(record);
-  group.steps.sort((a, b) => (a.step ?? 1) - (b.step ?? 1));
+  group.steps.sort(byStep);
   if (record.ts > group.ts) group.ts = record.ts;
   selectedHistory = Math.max(0, Math.min(selectedHistory, Math.max(0, historyGroups.length - 1)));
   if (appWindow === "history") renderHistory();
@@ -1944,7 +1957,7 @@ function recordHistory(target: RunTarget, result: RunResult, flowId?: string, st
     duration_ms: result.ms,
     captures: result.captures,
     ...(requestDetail ? { request_detail: redactResponse(requestDetail) } : {}),
-    response: redactResponse(formatRun(target.req, result, target.variant)),
+    response: redactResponse(formatRun(result, target.variant)),
     ...(result.error ? { error: result.error } : {}),
     ...(flowId ? { flow_id: flowId, step, flow_size: flowSize } : {}),
   };
@@ -2014,10 +2027,7 @@ function ensureSelectedRowVisible() {
 }
 
 function renderTree() {
-  for (const child of treeList.getChildren()) {
-    treeList.remove(child);
-    child.destroy();
-  }
+  clearChildren(treeList);
 
   treeRows.forEach((row, index) => {
     const selected = index === selectedRow;
@@ -2099,42 +2109,7 @@ function applyTextareaColors(target: TextareaRenderable) {
   target.focusedTextColor = C.fg;
 }
 
-function applyPalette() {
-  Object.assign(C, resolvePalette(CONFIG));
-  renderer.setBackgroundColor(C.bg);
-  tabBar.bg = C.panel;
-  statusBar.bg = C.panel;
-  for (const { line } of commandLines) { line.fg = C.fg; line.bg = C.panel; }
-  editorGutter.fg = C.dim;
-  editorGutter.bg = C.bg;
-  envDetailGutter.fg = C.dim;
-  envDetailGutter.bg = C.bg;
-  listBox.backgroundColor = C.bg;
-  verticalDivider.backgroundColor = C.bg;
-  filterInput.textColor = C.fg;
-  treeList.backgroundColor = C.bg;
-  editorBox.backgroundColor = C.bg;
-  applyTextareaColors(editor);
-  variantStrip.backgroundColor = C.panel;
-  horizontalDivider.backgroundColor = C.bg;
-  responseBox.backgroundColor = C.bg;
-  applyTextareaColors(respView);
-  historyWindow.backgroundColor = C.bg;
-  historyListBox.backgroundColor = C.bg;
-  historyDivider.backgroundColor = C.bg;
-  historyList.backgroundColor = C.bg;
-  historyDetailBox.backgroundColor = C.bg;
-  applyTextareaColors(historyDetail);
-  envWindow.backgroundColor = C.bg;
-  envListBox.backgroundColor = C.bg;
-  environmentDivider.backgroundColor = C.bg;
-  envList.backgroundColor = C.bg;
-  envDetailBox.backgroundColor = C.bg;
-  applyTextareaColors(envDetail);
-  helpBackdrop.backgroundColor = C.bg;
-  helpOverlay.borderColor = C.yellow;
-  helpOverlay.backgroundColor = C.bg;
-  helpText.textColor = C.fg;
+function refreshPaneBorders() {
   listBox.borderColor = appWindow === "workspace" && pane === "list" ? C.yellow : C.dim;
   editorBox.borderColor = appWindow === "workspace" && pane === "editor" ? C.yellow : C.dim;
   responseBox.borderColor = appWindow === "workspace" && pane === "response" ? C.yellow : C.dim;
@@ -2142,6 +2117,32 @@ function applyPalette() {
   historyDetailBox.borderColor = appWindow === "history" && historyPane === "detail" ? C.yellow : C.dim;
   envListBox.borderColor = appWindow === "environments" && envPane === "list" ? C.yellow : C.dim;
   envDetailBox.borderColor = appWindow === "environments" && envPane === "editor" ? C.yellow : C.dim;
+}
+
+function applyPalette() {
+  Object.assign(C, resolvePalette(CONFIG));
+  renderer.setBackgroundColor(C.bg);
+  tabBar.bg = C.panel;
+  statusBar.bg = C.panel;
+  variantStrip.backgroundColor = C.panel;
+  for (const { line } of commandLines) { line.fg = C.fg; line.bg = C.panel; }
+  editorGutter.fg = C.dim;
+  editorGutter.bg = C.bg;
+  envDetailGutter.fg = C.dim;
+  envDetailGutter.bg = C.bg;
+  filterInput.textColor = C.fg;
+  helpOverlay.borderColor = C.yellow;
+  helpText.textColor = C.fg;
+  const backgroundBoxes = [
+    listBox, treeList, editorBox, responseBox,
+    historyWindow, historyListBox, historyList, historyDetailBox,
+    envWindow, envListBox, envList, envDetailBox,
+    helpBackdrop, helpOverlay,
+    verticalDivider, horizontalDivider, historyDivider, environmentDivider,
+  ];
+  for (const box of backgroundBoxes) box.backgroundColor = C.bg;
+  for (const textarea of [editor, respView, historyDetail, envDetail]) applyTextareaColors(textarea);
+  refreshPaneBorders();
   variableSyntax = buildVariableSyntax();
   responseFailureSyntax = buildResponseFailureSyntax();
   refreshEditorHighlights();
@@ -2300,15 +2301,21 @@ function refreshGutters() {
   renderGutter(envDetail, envDetailGutter);
 }
 
+function modeLabel(): string {
+  if (appWindow === "history") return historyPane === "detail" ? (visual ? "VISUAL" : "RUN-DETAILS") : "HISTORY";
+  if (appWindow === "environments") return envInsert ? "ENV-INSERT" : envPane === "editor" ? "ENV-NORMAL" : "ENVIRONMENTS";
+  if (pane === "editor") return insert ? "INSERT" : visual ? "REQ-VISUAL" : "REQ-NORMAL";
+  if (pane === "response" && visual) return "VISUAL";
+  return pane.toUpperCase();
+}
+
 function setStatus() {
   renderTabs();
   refreshGutters();
   renderCommandLine();
   const dirtyInfos = dirtyBufferInfos();
   statusBar.fg = dirtyInfos.length > 0 ? C.yellow : C.fg;
-  const mode = appWindow === "history" ? (historyPane === "detail" ? (visual ? "VISUAL" : "RUN-DETAILS") : "HISTORY") : appWindow === "environments" ? (envInsert ? "ENV-INSERT" : envPane === "editor" ? "ENV-NORMAL" : "ENVIRONMENTS") : pane === "editor"
-    ? (insert ? "INSERT" : visual ? "REQ-VISUAL" : "REQ-NORMAL")
-    : pane === "response" && visual ? "VISUAL" : pane.toUpperCase();
+  const mode = modeLabel();
   const last = [...lastResult.entries()].slice(-1)[0];
   statusBar.content =
     ` ${appWindow === "workspace" ? "1 WORKSPACE" : appWindow === "history" ? "2 HISTORY" : "3 ENVIRONMENTS"} · ${mode}` +
@@ -2326,9 +2333,8 @@ function setPane(p: Pane) {
   commandBuffer = null;
   pane = p;
   insert = false;
-  listBox.borderColor = p === "list" ? C.yellow : C.dim;
-  editorBox.borderColor = p === "editor" ? C.yellow : C.dim;
-  responseBox.borderColor = p === "response" ? C.yellow : C.dim;
+  pending = null;
+  refreshPaneBorders();
   listBox.title = " REQUESTS ";
   editorBox.title = requestTitle();
   responseBox.title = " RESPONSE ";
@@ -2343,8 +2349,7 @@ function setHistoryPane(next: HistoryPane) {
   clearVisual();
   pending = null;
   historyPane = next;
-  historyListBox.borderColor = next === "list" ? C.yellow : C.dim;
-  historyDetailBox.borderColor = next === "detail" ? C.yellow : C.dim;
+  refreshPaneBorders();
   historyDetailBox.title = " RUN DETAILS ";
   if (next === "detail") historyDetail.focus();
   else historyDetail.blur();
@@ -2367,11 +2372,7 @@ function setWindow(next: AppWindow) {
   if (next === "history") {
     loadHistory();
     historyPane = "list";
-    historyListBox.borderColor = C.yellow;
-    historyDetailBox.borderColor = C.dim;
     historyDetailBox.title = " RUN DETAILS ";
-    envListBox.borderColor = C.dim;
-    envDetailBox.borderColor = C.dim;
   } else if (next === "environments") {
     selectedEnvironment = environmentIdx;
     if (envDirty() && envLoadedName && envLoadedName !== environments[environmentIdx]) {
@@ -2384,17 +2385,10 @@ function setWindow(next: AppWindow) {
     envPane = "list";
     renderEnvironments();
     loadEnvironmentFile();
-    historyListBox.borderColor = C.dim;
-    historyDetailBox.borderColor = C.dim;
-    envListBox.borderColor = C.yellow;
-    envDetailBox.borderColor = C.dim;
   } else {
-    historyListBox.borderColor = C.dim;
-    historyDetailBox.borderColor = C.dim;
-    envListBox.borderColor = C.dim;
-    envDetailBox.borderColor = C.dim;
     setPane(pane);
   }
+  refreshPaneBorders();
   setStatus();
 }
 
@@ -2415,7 +2409,7 @@ function formatRequest(r: RunResult): string | undefined {
     (r.request.body ? `\n  body:\n${indent(indent(formatBody(r.request.body)))}` : "");
 }
 
-function formatRun(req: Req, r: RunResult, variant?: string): string {
+function formatRun(r: RunResult, variant?: string): string {
   const ok = r.success;
   const request = formatRequest(r);
   return `${ok ? "✓" : "✗"} ${r.status} ${ok ? "OK" : "FAILED"} · ${r.ms}ms · env: ${environments[environmentIdx]}${variant ? ` · variant: ${variant}` : ""}\n\n` +
@@ -2438,7 +2432,7 @@ async function runRequest(req: Req) {
   lastResult.set(key, r.success ? "ok" : "fail");
   lastBodies.clear();
   if (r.body) lastBodies.set(key, r.body);
-  renderResponse(formatRun(req, r, variant), !r.success);
+  renderResponse(formatRun(r, variant), !r.success);
   refreshEditorHighlights();
   recordHistory({ req, variant }, r);
   refreshList(req.name);
@@ -2466,7 +2460,7 @@ async function runFlow() {
     const key = targetKey(target.req, target.variant);
     lastResult.set(key, r.success ? "ok" : "fail");
     if (r.body) lastBodies.set(key, r.body);
-    const response = formatRun(target.req, r, target.variant);
+    const response = formatRun(r, target.variant);
     recordHistory(target, r, flowId, index + 1, targets.length);
     return `▸ ${index + 1}. ${key}\n${response}`;
   });
@@ -2524,6 +2518,21 @@ function enterVisual(target: TextareaRenderable, kind: "char" | "line") {
   setStatus();
 }
 
+function applyVimMotion(target: TextareaRenderable, k: string, key: KeyEvent): boolean {
+  const eb = target.editBuffer;
+  if (k === "h") eb.moveCursorLeft();
+  else if (k === "l") eb.moveCursorRight();
+  else if (k === "j") eb.moveCursorDown();
+  else if (k === "k") eb.moveCursorUp();
+  else if (k === "w") { const c = eb.getNextWordBoundary(); eb.setCursor(c.row, c.col); }
+  else if (k === "b") { const c = eb.getPrevWordBoundary(); eb.setCursor(c.row, c.col); }
+  else if (k === "0") eb.setCursor(eb.getCursorPosition().row, 0);
+  else if (k === "$" || (k === "4" && key.shift)) { const e = eb.getEOL(); eb.setCursor(e.row, e.col); }
+  else if (k === "G" || (k === "g" && key.shift)) eb.gotoLine(eb.getLineCount() - 1);
+  else return false;
+  return true;
+}
+
 function moveVisual(target: TextareaRenderable, k: string, key: KeyEvent): boolean {
   const eb = target.editBuffer;
   if (k === "escape") {
@@ -2547,16 +2556,13 @@ function moveVisual(target: TextareaRenderable, k: string, key: KeyEvent): boole
     setStatus();
     return true;
   }
-  if (k === "j") eb.moveCursorDown();
-  else if (k === "k") eb.moveCursorUp();
-  else if (k === "h") eb.moveCursorLeft();
-  else if (k === "l") eb.moveCursorRight();
-  else if (k === "w") { const c = eb.getNextWordBoundary(); eb.setCursor(c.row, c.col); }
-  else if (k === "b") { const c = eb.getPrevWordBoundary(); eb.setCursor(c.row, c.col); }
-  else if (k === "0") eb.setCursor(eb.getCursorPosition().row, 0);
-  else if (k === "$" || (k === "4" && key.shift)) { const e = eb.getEOL(); eb.setCursor(e.row, e.col); }
-  else if (k === "G" || (k === "g" && key.shift)) eb.gotoLine(eb.getLineCount() - 1);
-  else if (k === "g") {
+  if (applyVimMotion(target, k, key)) {
+    ensureCursorVisible(target);
+    updateVisualSelection(target);
+    setStatus();
+    return true;
+  }
+  if (k === "g") {
     pending = "g";
     setStatus();
     return true;
@@ -2566,13 +2572,8 @@ function moveVisual(target: TextareaRenderable, k: string, key: KeyEvent): boole
     clearVisual();
     setStatus();
     return true;
-  } else {
-    return false;
   }
-  ensureCursorVisible(target);
-  updateVisualSelection(target);
-  setStatus();
-  return true;
+  return false;
 }
 
 function vimNormal(k: string, key: KeyEvent, target: TextareaRenderable = editor, readOnly = false, editKind: "request" | "environment" = "request") {
@@ -2626,28 +2627,21 @@ function vimNormal(k: string, key: KeyEvent, target: TextareaRenderable = editor
   else if (!readOnly && k === "o" && !shift) { const e = eb.getEOL(); eb.setCursor(e.row, e.col); startInsert(); eb.newLine(); }
   else if (!readOnly && (k === "O" || (k === "o" && shift))) { eb.setCursor(eb.getCursorPosition().row, 0); startInsert(); eb.newLine(); eb.moveCursorUp(); }
   else if (key.ctrl && (k === "d" || k === "u")) scrollText(target, k === "d" ? 5 : -5);
-  else if (k === "h") eb.moveCursorLeft();
-  else if (k === "l") eb.moveCursorRight();
-  else if (k === "j") eb.moveCursorDown();
-  else if (k === "k") eb.moveCursorUp();
-  else if (k === "w") { const c = eb.getNextWordBoundary(); eb.setCursor(c.row, c.col); }
-  else if (k === "b") { const c = eb.getPrevWordBoundary(); eb.setCursor(c.row, c.col); }
-  else if (k === "0") eb.setCursor(eb.getCursorPosition().row, 0);
-  else if (k === "$" || (k === "4" && shift)) { const e = eb.getEOL(); eb.setCursor(e.row, e.col); }
-  else if (k === "G" || (k === "g" && shift)) eb.gotoLine(eb.getLineCount() - 1);
-  else if (k === "g" || k === "y" || (!readOnly && (k === "d" || k === "c"))) pending = k;
-  else if (k === "Y" || (k === "y" && shift)) {
-    register = target.plainText;
-    statusMsg = `yanked whole buffer (${copyToClipboard(renderer, register)})`;
+  else if (!applyVimMotion(target, k, key)) {
+    if (k === "g" || k === "y" || (!readOnly && (k === "d" || k === "c"))) pending = k;
+    else if (k === "Y" || (k === "y" && shift)) {
+      register = target.plainText;
+      statusMsg = `yanked whole buffer (${copyToClipboard(renderer, register)})`;
+    }
+    else if (!readOnly && k === "x") eb.deleteChar();
+    else if (!readOnly && (k === "D" || (k === "d" && shift))) { const c = eb.getCursorPosition(); const e = eb.getEOL(); eb.deleteRange(c.row, c.col, e.row, e.col); }
+    else if (!readOnly && (k === "C" || (k === "c" && shift))) { const c = eb.getCursorPosition(); const e = eb.getEOL(); eb.deleteRange(c.row, c.col, e.row, e.col); startInsert(); }
+    else if (!readOnly && k === "p") {
+      if (register) { const e = eb.getEOL(); eb.setCursor(e.row, e.col); eb.newLine(); eb.insertText(register.replace(/\n$/, "")); }
+    }
+    else if (!readOnly && k === "u") eb.undo();
+    else if (k === "r" && key.ctrl) eb.redo();
   }
-  else if (!readOnly && k === "x") eb.deleteChar();
-  else if (!readOnly && (k === "D" || (k === "d" && shift))) { const c = eb.getCursorPosition(); const e = eb.getEOL(); eb.deleteRange(c.row, c.col, e.row, e.col); }
-  else if (!readOnly && (k === "C" || (k === "c" && shift))) { const c = eb.getCursorPosition(); const e = eb.getEOL(); eb.deleteRange(c.row, c.col, e.row, e.col); startInsert(); }
-  else if (!readOnly && k === "p") {
-    if (register) { const e = eb.getEOL(); eb.setCursor(e.row, e.col); eb.newLine(); eb.insertText(register.replace(/\n$/, "")); }
-  }
-  else if (!readOnly && k === "u") eb.undo();
-  else if (k === "r" && key.ctrl) eb.redo();
   ensureCursorVisible(target);
   setStatus();
 }
@@ -2678,7 +2672,6 @@ function saveEditor() {
 function enterCommandLine() {
   commandBuffer = "";
   pending = null;
-  listPending = null;
   setStatus();
 }
 
@@ -2715,13 +2708,7 @@ function runCommandLine(cmd: string) {
       if (envDirty()) saveEnvironmentFile();
     }
     if (quit) {
-      const dirtyName = dirtyBufferName();
-      if (dirtyName && !force) {
-        focusDirtyBuffer(dirtyName);
-        return;
-      }
-      renderer.destroy();
-      process.exit(0);
+      quitApp(force);
     }
     return;
   }
@@ -2740,8 +2727,7 @@ function runCommandLine(cmd: string) {
     } else {
       if (inEnvWindow) saveEnvironmentFile();
       else saveEditor();
-      renderer.destroy();
-      process.exit(0);
+      quitApp(force);
     }
     return;
   }
@@ -2766,13 +2752,7 @@ function runCommandLine(cmd: string) {
     setPane("list");
     return;
   }
-  const dirtyName = dirtyBufferName();
-  if (dirtyName && !force) {
-    focusDirtyBuffer(dirtyName);
-    return;
-  }
-  renderer.destroy();
-  process.exit(0);
+  quitApp(force);
 }
 
 const VIM_MOVE: [string, string][] = [
@@ -2907,9 +2887,23 @@ function showHelp() {
   helpOverlay.visible = true;
 }
 
+function handleInputShortcut(key: KeyEvent, k: string) {
+  if (insert) {
+    if (key.ctrl && k === "s") { saveEditor(); key.preventDefault(); }
+    else if (key.ctrl && k === "l") { setPane("response"); key.preventDefault(); }
+    else if (key.ctrl && k === "h") { setPane("list"); key.preventDefault(); }
+    else if (k === "escape") { leaveInsert(); key.preventDefault(); }
+  } else if (envInsert) {
+    if (key.ctrl && k === "s") { saveEnvironmentFile(); key.preventDefault(); }
+    else if (key.ctrl && k === "h") { leaveEnvInsert(); setEnvPane("list"); key.preventDefault(); }
+    else if (k === "escape") { leaveEnvInsert(); key.preventDefault(); }
+  }
+}
+
 renderer.keyInput.on("keypress", (key: KeyEvent) => {
   const k = key.name;
   if (helpVisible) { hideHelp(); setStatus(); key.preventDefault(); return; }
+  if (filterInputFocused() && k === "escape") { filterInput.blur(); setPane("list"); key.preventDefault(); return; }
   if (commandBuffer !== null) {
     if (k === "escape") { commandBuffer = null; setStatus(); }
     else if (k === "return" || k === "enter") { const cmd = commandBuffer; commandBuffer = null; runCommandLine(cmd); setStatus(); }
@@ -2920,13 +2914,18 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
   }
   if (k === "?" && !insert && !envInsert && !filterInputFocused()) { showHelp(); key.preventDefault(); return; }
 
-  if (!insert && !envInsert && !visual && !pending && !listPending && !filterInputFocused()) {
-    if (k === "1") { setWindow("workspace"); key.preventDefault(); return; }
-    if (k === "2") { setWindow("history"); key.preventDefault(); return; }
-    if (k === "3") { setWindow("environments"); key.preventDefault(); return; }
+  // Insert-style modes let the focused widget consume keys; only a few shortcuts are
+  // intercepted. Every other key falls through to the single preventDefault below.
+  if (insert || envInsert || filterInputFocused()) { handleInputShortcut(key, k); return; }
+  key.preventDefault();
+
+  if (!visual && !pending) {
+    if (k === "1") { setWindow("workspace"); return; }
+    if (k === "2") { setWindow("history"); return; }
+    if (k === "3") { setWindow("environments"); return; }
   }
 
-  if ((appWindow === "workspace" || appWindow === "history" || appWindow === "environments") && (key.meta || key.option) && !insert && !envInsert && !visual && !pending && !filterInputFocused()) {
+  if ((key.meta || key.option) && !visual && !pending) {
     if (appWindow === "workspace") {
       if (k === "h") setSplits(sidebarSplit - 3, editorSplit);
       else if (k === "l") setSplits(sidebarSplit + 3, editorSplit);
@@ -2949,45 +2948,31 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
       statusMsg = `environment sidebar: ${environmentSplit} columns`;
     }
     setStatus();
-    key.preventDefault();
     return;
   }
 
   if (appWindow === "environments") {
-    if (envInsert) {
-      if (k === "s" && key.ctrl) { saveEnvironmentFile(); key.preventDefault(); return; }
-      if (k === "h" && key.ctrl) { leaveEnvInsert(); setEnvPane("list"); key.preventDefault(); return; }
-      if (k === "escape") {
-        leaveEnvInsert();
-        key.preventDefault(); return;
-      }
+    if (k === "q") { quitApp(); return; }
+    if (envPane === "editor") {
+      if (key.ctrl && k === "s") { saveEnvironmentFile(); return; }
+      if (key.ctrl && k === "h") { setEnvPane("list"); return; }
+      if (k === "escape") { setEnvPane("list"); return; }
+      if (!visual && (k === ":" || (k === ";" && key.shift))) { enterCommandLine(); return; }
+      vimNormal(k, key, envDetail, false, "environment");
       return;
     }
-    if (k === "q") {
-      const dirtyName = dirtyBufferName();
-      if (dirtyName) { focusDirtyBuffer(dirtyName); key.preventDefault(); return; }
-      renderer.destroy(); process.exit(0);
-    }
-    if (envPane === "editor") {
-      if (key.ctrl && k === "s") { saveEnvironmentFile(); key.preventDefault(); return; }
-      if (key.ctrl && k === "h") { setEnvPane("list"); key.preventDefault(); return; }
-      if (k === "escape") { setEnvPane("list"); key.preventDefault(); return; }
-      if (!visual && (k === ":" || (k === ";" && key.shift))) { enterCommandLine(); key.preventDefault(); return; }
-      vimNormal(k, key, envDetail, false, "environment");
-      key.preventDefault(); return;
-    }
-    if (key.ctrl && k === "l") { setEnvPane("editor"); key.preventDefault(); return; }
-    if (k === "l") { setEnvPane("editor"); key.preventDefault(); return; }
-    if (k === "escape" || k === "1") { setWindow("workspace"); key.preventDefault(); return; }
+    if (key.ctrl && k === "l") { setEnvPane("editor"); return; }
+    if (k === "l") { setEnvPane("editor"); return; }
+    if (k === "escape" || k === "1") { setWindow("workspace"); return; }
     if (k === "j") {
       const next = Math.min(environments.length - 1, selectedEnvironment + 1);
-      if (envDirty() && environments[next] !== envLoadedName) { warnDirty(`.env.${envLoadedName}`); key.preventDefault(); return; }
-      selectedEnvironment = next; renderEnvironments(); loadEnvironmentFile(); key.preventDefault(); return;
+      if (envDirty() && environments[next] !== envLoadedName) { warnDirty(`.env.${envLoadedName}`); return; }
+      selectedEnvironment = next; renderEnvironments(); loadEnvironmentFile(); return;
     }
     if (k === "k") {
       const next = Math.max(0, selectedEnvironment - 1);
-      if (envDirty() && environments[next] !== envLoadedName) { warnDirty(`.env.${envLoadedName}`); key.preventDefault(); return; }
-      selectedEnvironment = next; renderEnvironments(); loadEnvironmentFile(); key.preventDefault(); return;
+      if (envDirty() && environments[next] !== envLoadedName) { warnDirty(`.env.${envLoadedName}`); return; }
+      selectedEnvironment = next; renderEnvironments(); loadEnvironmentFile(); return;
     }
     if (k === "enter" || k === "return") {
       environmentIdx = selectedEnvironment;
@@ -2995,104 +2980,80 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
       renderEnvironments();
       statusMsg = `active environment: ${environments[environmentIdx]}`;
       setStatus();
-      key.preventDefault(); return;
+      return;
     }
-    if (k === "e") {
-      setEnvPane("editor");
-      key.preventDefault(); return;
-    }
-    if (k === "i") {
-      setEnvPane("editor");
-      enterEnvInsert();
-      key.preventDefault(); return;
-    }
-    if (k === "r" && key.ctrl) { secretsRevealed = !secretsRevealed; renderEnvironments(); loadEnvironmentFile(); key.preventDefault(); return; }
-    key.preventDefault();
+    if (k === "e") { setEnvPane("editor"); return; }
+    if (k === "i") { setEnvPane("editor"); enterEnvInsert(); return; }
+    if (k === "r" && key.ctrl) { secretsRevealed = !secretsRevealed; renderEnvironments(); loadEnvironmentFile(); return; }
     return;
   }
 
   if (appWindow === "history") {
     if (historyPane === "detail") {
-      if (key.ctrl && k === "h") { setHistoryPane("list"); key.preventDefault(); return; }
-      if (k === "escape") { setHistoryPane("list"); key.preventDefault(); return; }
+      if (key.ctrl && k === "h") { setHistoryPane("list"); return; }
+      if (k === "escape") { setHistoryPane("list"); return; }
       vimNormal(k, key, historyDetail, true);
-      key.preventDefault(); return;
+      return;
     }
-    if (k === "q") {
-      const dirtyName = dirtyBufferName();
-      if (dirtyName) { focusDirtyBuffer(dirtyName); key.preventDefault(); return; }
-      renderer.destroy(); process.exit(0);
-    }
-    if (k === "escape") { setWindow("workspace"); key.preventDefault(); return; }
-    if (k === "j") { moveHistory(1); key.preventDefault(); return; }
-    if (k === "k") { moveHistory(-1); key.preventDefault(); return; }
-    if (key.ctrl && k === "d") { moveHistory(5); key.preventDefault(); return; }
-    if (key.ctrl && k === "u") { moveHistory(-5); key.preventDefault(); return; }
-    if (key.ctrl && k === "l") { setHistoryPane("detail"); key.preventDefault(); return; }
-    if (k === "l") { setHistoryPane("detail"); key.preventDefault(); return; }
-    if (k === "g") { selectedHistory = 0; renderHistory(); key.preventDefault(); return; }
-    if (k === "G") { selectedHistory = Math.max(0, historyGroups.length - 1); renderHistory(); key.preventDefault(); return; }
-    if (k === "enter" || k === "return") { setHistoryPane("detail"); key.preventDefault(); return; }
+    if (k === "q") { quitApp(); return; }
+    if (k === "escape") { setWindow("workspace"); return; }
+    if (k === "j") { moveHistory(1); return; }
+    if (k === "k") { moveHistory(-1); return; }
+    if (key.ctrl && k === "d") { moveHistory(5); return; }
+    if (key.ctrl && k === "u") { moveHistory(-5); return; }
+    if (key.ctrl && k === "l") { setHistoryPane("detail"); return; }
+    if (k === "l") { setHistoryPane("detail"); return; }
+    if (k === "g") { selectedHistory = 0; renderHistory(); return; }
+    if (k === "G") { selectedHistory = Math.max(0, historyGroups.length - 1); renderHistory(); return; }
+    if (k === "enter" || k === "return") { setHistoryPane("detail"); return; }
     if (k === "y") {
       statusMsg = `copied history (${copyToClipboard(renderer, historyDetail.plainText)})`;
-      setStatus(); key.preventDefault(); return;
+      setStatus(); return;
     }
-    key.preventDefault();
     return;
   }
 
   if (pane === "editor") {
-    if (k === "s" && key.ctrl) { saveEditor(); key.preventDefault(); return; }
-    if (k === "l" && key.ctrl) { setPane("response"); key.preventDefault(); return; }
-    if (k === "h" && key.ctrl) { setPane("list"); key.preventDefault(); return; }
-    if (insert) {
-      if (k === "escape") { leaveInsert(); key.preventDefault(); }
-      return;
-    }
-    if (visual && k === "escape") { clearVisual(); setStatus(); key.preventDefault(); return; }
-    if (k === "escape") { setPane("list"); key.preventDefault(); return; }
-    if (!visual && (k === ":" || (k === ";" && key.shift))) { enterCommandLine(); key.preventDefault(); return; }
-    if (k === "[") { cycleVariant(-1); key.preventDefault(); return; }
-    if (k === "]") { cycleVariant(1); key.preventDefault(); return; }
+    if (k === "s" && key.ctrl) { saveEditor(); return; }
+    if (k === "l" && key.ctrl) { setPane("response"); return; }
+    if (k === "h" && key.ctrl) { setPane("list"); return; }
+    if (visual && k === "escape") { clearVisual(); setStatus(); return; }
+    if (k === "escape") { setPane("list"); return; }
+    if (!visual && (k === ":" || (k === ";" && key.shift))) { enterCommandLine(); return; }
+    if (k === "[") { cycleVariant(-1); return; }
+    if (k === "]") { cycleVariant(1); return; }
     vimNormal(k, key);
-    key.preventDefault();
     return;
   }
 
-  if (k === "q" && pane === "list" && !filterInputFocused()) {
-    const dirtyName = dirtyBufferName();
-    if (dirtyName) { focusDirtyBuffer(dirtyName); key.preventDefault(); return; }
-    renderer.destroy(); process.exit(0);
-  }
-  if (k === "l" && key.ctrl) { setPane(pane === "list" ? "editor" : "response"); key.preventDefault(); return; }
-  if (k === "h" && key.ctrl) { setPane(pane === "response" ? "editor" : "list"); key.preventDefault(); return; }
-  if (visual && k === "escape") { clearVisual(); setStatus(); key.preventDefault(); return; }
-  if (k === "escape") { setPane("list"); key.preventDefault(); return; }
+  if (k === "q" && pane === "list") { quitApp(); return; }
+  if (k === "l" && key.ctrl) { setPane(pane === "list" ? "editor" : "response"); return; }
+  if (k === "h" && key.ctrl) { setPane(pane === "response" ? "editor" : "list"); return; }
+  if (visual && k === "escape") { clearVisual(); setStatus(); return; }
+  if (k === "escape") { setPane("list"); return; }
   if (k === "p" && key.ctrl) {
     environmentIdx = (environmentIdx + 1) % environments.length;
     selectedEnvironment = environmentIdx;
     refreshEditorHighlights();
     setStatus();
-    key.preventDefault(); return;
+    return;
   }
 
   if (pane === "list") {
-    if (filterInputFocused()) return;
-    if (k === "/" ) { filterInput.focus(); key.preventDefault(); return; }
-    if (listPending) {
-      const pendingList = listPending;
-      listPending = null;
-      if (pendingList === "g" && k === "g") {
+    if (k === "/" ) { filterInput.focus(); return; }
+    if (pending) {
+      const pendingKey = pending;
+      pending = null;
+      if (pendingKey === "g" && k === "g") {
         selectedRow = 0;
         renderTree();
       }
-      key.preventDefault();
       return;
     }
-    if (key.ctrl && k === "d") { moveSelection(5); key.preventDefault(); return; }
-    if (key.ctrl && k === "u") { moveSelection(-5); key.preventDefault(); return; }
-    if (k === "j") { moveSelection(1); key.preventDefault(); return; }
-    if (k === "k") { moveSelection(-1); key.preventDefault(); return; }
+    if (key.ctrl && k === "d") { moveSelection(5); return; }
+    if (key.ctrl && k === "u") { moveSelection(-5); return; }
+    if (k === "j") { moveSelection(1); return; }
+    if (k === "k") { moveSelection(-1); return; }
     if (k === "l") {
       const row = treeRows[selectedRow];
       if (row?.type === "folder") {
@@ -3101,25 +3062,25 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
       } else if (row) {
         setPane("editor");
       }
-      key.preventDefault(); return;
+      return;
     }
-    if (k === "g" && !key.shift) { listPending = "g"; setStatus(); key.preventDefault(); return; }
-    if (k === "G" || (k === "g" && key.shift)) { selectedRow = Math.max(0, treeRows.length - 1); renderTree(); key.preventDefault(); return; }
-    if ((k === "enter" || k === "return") && key.shift) { runFlow(); key.preventDefault(); return; }
-    if (k === "enter" || k === "return") { activateSelection(); key.preventDefault(); return; }
+    if (k === "g" && !key.shift) { pending = "g"; setStatus(); return; }
+    if (k === "G" || (k === "g" && key.shift)) { selectedRow = Math.max(0, treeRows.length - 1); renderTree(); return; }
+    if ((k === "enter" || k === "return") && key.shift) { runFlow(); return; }
+    if (k === "enter" || k === "return") { activateSelection(); return; }
     if (k === "tab") {
       const r = currentReq();
       if (r) { toggleFlowRequest(r); refreshList(r.name); setStatus(); }
-      key.preventDefault(); return;
+      return;
     }
-    if (k === "f" && key.ctrl) { runFlow(); key.preventDefault(); return; }
-    if (k === "e") { setPane("editor"); key.preventDefault(); return; }
-    if (k === "i") { setPane("editor"); enterInsert(); key.preventDefault(); return; }
-    if (k === "v") { cycleVariant(1); key.preventDefault(); return; }
-    if (k === "[") { cycleVariant(-1); key.preventDefault(); return; }
-    if (k === "]") { cycleVariant(1); key.preventDefault(); return; }
+    if (k === "f" && key.ctrl) { runFlow(); return; }
+    if (k === "e") { setPane("editor"); return; }
+    if (k === "i") { setPane("editor"); enterInsert(); return; }
+    if (k === "v") { cycleVariant(1); return; }
+    if (k === "[") { cycleVariant(-1); return; }
+    if (k === "]") { cycleVariant(1); return; }
     if (k === "n" && key.ctrl) {
-      if (editorDirty() && editorEntry) { warnDirty(editorEntry.reqName); key.preventDefault(); return; }
+      if (editorDirty() && editorEntry) { warnDirty(editorEntry.reqName); return; }
       const name = `untitled-${Date.now() % 100000}`;
       const file = join(COLLECTION, `${name}.hurl`);
       const template = "# TODO: describe this request\nGET {{host}}/\n";
@@ -3129,11 +3090,11 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
       refreshList(name);
       editor.setText(template);
       setPane("editor");
-      key.preventDefault(); return;
+      return;
     }
     if (k === "x" && key.ctrl) {
       const r = currentReq();
-      if (r && editorDirty() && editorEntry && r.name === editorEntry.reqName) { warnDirty(editorEntry.reqName); key.preventDefault(); return; }
+      if (r && editorDirty() && editorEntry && r.name === editorEntry.reqName) { warnDirty(editorEntry.reqName); return; }
       if (r) {
         rmSync(r.file);
         requests.splice(requests.indexOf(r), 1);
@@ -3143,7 +3104,7 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
         for (const key of [...lastResult.keys()]) if (key === r.name || key.startsWith(`${r.name}@`)) lastResult.delete(key);
         refreshList(); statusMsg = `deleted ${r.name}`; setStatus();
       }
-      key.preventDefault(); return;
+      return;
     }
     if (k === "y" && !key.shift) {
       const r = currentReq();
@@ -3152,13 +3113,13 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
         const cmd = `hurl <<'HURL_EOF'\n${rendered}HURL_EOF`;
         statusMsg = `copied hurl command (${copyToClipboard(renderer, cmd)})`;
       }
-      setStatus(); key.preventDefault(); return;
+      setStatus(); return;
     }
     if (k === "Y" || (k === "y" && key.shift)) {
       const r = currentReq();
       const cmd = r ? renderCurl(renderTemplate(entrySource(r, currentVariant(r)))) : undefined;
       statusMsg = cmd ? `copied curl (${copyToClipboard(renderer, cmd)})` : "couldn't build a curl command for this request";
-      setStatus(); key.preventDefault(); return;
+      setStatus(); return;
     }
   }
 
@@ -3167,12 +3128,12 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
       const sel = renderer.getSelection();
       const text = respView.hasSelection() ? respView.getSelectedText() : sel?.getSelectedText();
       statusMsg = text ? `copied selection (${copyToClipboard(renderer, text)})` : "no selection, use v/V or drag with mouse first";
-      setStatus(); key.preventDefault(); return;
+      setStatus(); return;
     }
     if (k === "s") {
       if (lastBodies.size === 0) {
         statusMsg = "no body to save, run a request first";
-        setStatus(); key.preventDefault(); return;
+        setStatus(); return;
       }
       const dir = join(COLLECTION, ".termurl", "bodies");
       mkdirSync(dir, { recursive: true });
@@ -3186,10 +3147,9 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
         saved.push(file);
       }
       statusMsg = saved.length === 1 ? `body saved: ${saved[0]}` : `${saved.length} bodies saved to ${dir}`;
-      setStatus(); key.preventDefault(); return;
+      setStatus(); return;
     }
     vimNormal(k, key, respView, true);
-    key.preventDefault();
     return;
   }
 });
@@ -3219,9 +3179,6 @@ envDetail.onKeyDown = (key) => {
     key.preventDefault();
   }
 };
-renderer.keyInput.on("keypress", (key: KeyEvent) => {
-  if (filterInputFocused() && key.name === "escape") { filterInput.blur(); setPane("list"); key.preventDefault(); }
-});
 
 loadHistory();
 refreshList(requests[0]?.name);
