@@ -50,10 +50,11 @@ function cliArgs(): string[] {
 
 function scaffoldCollection(dir: string) {
   if (existsSync(dir) && readdirSync(dir).length > 0) return;
-  mkdirSync(join(dir, "httpbin"), { recursive: true });
+  mkdirSync(join(dir, "requests", "httpbin"), { recursive: true });
+  mkdirSync(join(dir, "flows"), { recursive: true });
   writeFileSync(join(dir, ".env.dev"), "# dev environment variables\nhost=https://httpbin.org\n");
   writeFileSync(join(dir, ".env.example"), "# Example environment file. Copy to .env.dev or another .env.<name>.\n# Keys prefixed with secret_ are masked until explicitly revealed.\n# secret_token=change-me\n");
-  writeFileSync(join(dir, "httpbin", "get.hurl"), "# Sample request\nGET {{host}}/get\nHTTP 200\n");
+  writeFileSync(join(dir, "requests", "httpbin", "get.hurl"), "# Sample request\nGET {{host}}/get\nHTTP 200\n");
 }
 
 async function runInit(defaultPath: string, nonInteractive = false) {
@@ -265,14 +266,15 @@ function walkDirs(dir: string, base = dir, acc: string[] = []): string[] {
 }
 
 function loadRequestDirs(collection = COLLECTION): string[] {
-  return walkDirs(collection).sort((a, b) => a.localeCompare(b));
+  return walkDirs(join(collection, "requests")).sort((a, b) => a.localeCompare(b));
 }
 
 function loadRequests(collection = COLLECTION): Req[] {
-  return walk(collection)
+  const root = join(collection, "requests");
+  return walk(root)
     .map((file) => {
       const src = readFileSync(file, "utf8");
-      const name = relative(collection, file).replace(/\.hurl$/, "");
+      const name = relative(root, file).replace(/\.hurl$/, "");
       const desc = src.match(/^# (.+)$/m)?.[1] ?? "";
       const reqLine = src.match(REQUEST_CAPTURE);
       const method = reqLine?.[1] ?? "?";
@@ -770,7 +772,7 @@ function parseCliVariables(values: string[]): { variables?: Record<string, strin
 function requestForInput(input: string): Req | undefined {
   const withoutExtension = input.replace(/\.hurl$/, "");
   const absolute = resolve(input);
-  const relativeName = COLLECTION ? relative(COLLECTION, absolute).replace(/\.hurl$/, "") : "";
+  const relativeName = COLLECTION ? relative(join(COLLECTION, "requests"), absolute).replace(/\.hurl$/, "") : "";
   return requests.find((request) => request.name === input || request.name === withoutExtension || request.name === relativeName || request.file === absolute);
 }
 
@@ -953,6 +955,8 @@ function doctorCommand(json: boolean): number {
   const configExists = existsSync(CONFIG_FILE);
   const configuredCollection = CONFIG.collection ? resolve(expandHome(CONFIG.collection)) : undefined;
   const collectionExists = Boolean(configuredCollection && existsSync(configuredCollection) && statSync(configuredCollection).isDirectory());
+  const requestsDir = configuredCollection ? join(configuredCollection, "requests") : undefined;
+  const requestsExist = Boolean(requestsDir && existsSync(requestsDir) && statSync(requestsDir).isDirectory());
   const collectionRequests = collectionExists ? loadRequests(configuredCollection as string).length : 0;
   const collectionFlows = collectionExists ? loadFlows(configuredCollection as string).length : 0;
   const names = collectionExists ? environmentNames(configuredCollection as string) : [];
@@ -963,15 +967,20 @@ function doctorCommand(json: boolean): number {
       ok: collectionExists,
       detail: collectionExists ? `${configuredCollection} (${collectionRequests} requests, ${collectionFlows} flows)` : configuredCollection ? `not found: ${configuredCollection}` : "not configured",
     },
+    requests: {
+      ok: requestsExist,
+      detail: requestsExist ? requestsDir! : configuredCollection ? `missing: ${requestsDir} (requests live here; move your .hurl files into it)` : "not configured",
+    },
     environments: { ok: collectionExists, names },
   };
-  const ok = checks.hurl.ok && checks.config.ok && checks.collection.ok;
+  const ok = checks.hurl.ok && checks.config.ok && checks.collection.ok && checks.requests.ok;
   if (json) {
     console.log(JSON.stringify({ ok, ...checks }, null, 2));
   } else {
     console.log(`${checks.hurl.ok ? "ok" : "fail"} hurl: ${checks.hurl.detail}`);
     console.log(`${checks.config.ok ? "ok" : "fail"} config: ${checks.config.detail}`);
     console.log(`${checks.collection.ok ? "ok" : "fail"} collection: ${checks.collection.detail}`);
+    console.log(`${checks.requests.ok ? "ok" : "fail"} requests: ${checks.requests.detail}`);
     console.log(`info environments: ${names.join(", ") || "none"}`);
   }
   return ok ? 0 : 1;
@@ -3019,11 +3028,15 @@ function remapRequestReferences(rename: Map<string, string>, remove: Set<string>
   normalizeFlowQueue();
 }
 
+function requestsBase(): string {
+  return join(COLLECTION, "requests");
+}
+
 function createRequestPath(value: string): boolean {
   const parsed = parseNameInput(value, ".hurl");
   if ("error" in parsed) { statusMsg = parsed.error; setStatus(); return false; }
   if (parsed.kind === "dir") {
-    const dir = join(COLLECTION, parsed.path);
+    const dir = join(requestsBase(), parsed.path);
     if (existsSync(dir)) { statusMsg = `folder ${parsed.path}/ already exists`; setStatus(); return false; }
     mkdirSync(dir, { recursive: true });
     reloadRequests();
@@ -3032,7 +3045,7 @@ function createRequestPath(value: string): boolean {
     setStatus();
     return true;
   }
-  const file = join(COLLECTION, `${parsed.path}.hurl`);
+  const file = join(requestsBase(), `${parsed.path}.hurl`);
   if (existsSync(file)) { statusMsg = `request ${parsed.path} already exists`; setStatus(); return false; }
   mkdirSync(dirname(file), { recursive: true });
   writeFileSync(file, "# TODO: describe this request\nGET {{host}}/\n");
@@ -3053,14 +3066,14 @@ function renameRequestPath(value: string): boolean {
   if ("error" in parsed) { statusMsg = parsed.error; setStatus(); return false; }
   if (row.type === "folder") {
     if (parsed.path === row.path) return false;
-    const target = join(COLLECTION, parsed.path);
+    const target = join(requestsBase(), parsed.path);
     if (existsSync(target)) { statusMsg = `folder ${parsed.path}/ already exists`; setStatus(); return false; }
     const mapping = new Map<string, string>();
     for (const req of requests) {
       if (req.name.startsWith(`${row.path}/`)) mapping.set(req.name, `${parsed.path}${req.name.slice(row.path.length)}`);
     }
     mkdirSync(dirname(target), { recursive: true });
-    renameSync(join(COLLECTION, row.path), target);
+    renameSync(join(requestsBase(), row.path), target);
     applyFlowReferenceChange(mapping, new Set());
     reloadRequests();
     remapRequestReferences(mapping, new Set());
@@ -3071,7 +3084,7 @@ function renameRequestPath(value: string): boolean {
   }
   const req = row.req;
   if (parsed.path === req.name) return false;
-  const target = join(COLLECTION, `${parsed.path}.hurl`);
+  const target = join(requestsBase(), `${parsed.path}.hurl`);
   if (existsSync(target)) { statusMsg = `request ${parsed.path} already exists`; setStatus(); return false; }
   mkdirSync(dirname(target), { recursive: true });
   renameSync(req.file, target);
@@ -3095,7 +3108,7 @@ function deleteRequestPath() {
     }
     const names = new Set(requests.filter((req) => req.name.startsWith(`${row.path}/`)).map((req) => req.name));
     applyFlowReferenceChange(new Map(), names);
-    rmSync(join(COLLECTION, row.path), { recursive: true, force: true });
+    rmSync(join(requestsBase(), row.path), { recursive: true, force: true });
     reloadRequests();
     remapRequestReferences(new Map(), names);
     refreshList();

@@ -61,8 +61,9 @@ termurl init
 
 The installer defaults to `~/collection`, writes
 `~/.config/termurl/config.toml` (respecting `XDG_CONFIG_HOME`), and scaffolds a
-starter request. The config is required. To use another collection for one
-session, pass its path when launching the TUI:
+`requests/` and `flows/` layout with a starter request. The config is required.
+To use another collection for one session, pass its path when launching the
+TUI:
 
 ```bash
 termurl ./my-apis
@@ -108,7 +109,7 @@ Useful controls:
   them in any other terminal.
 - `s`: save the complete response body to `.termurl/bodies/`.
 - `a`: create a request/flow or folder (a trailing `/` makes a folder, naming
-  follows the collection-relative path); `r`: rename the selected file/folder;
+  follows the `requests/`-relative path); `r`: rename the selected file/folder;
   `d`: delete it (asks to confirm). Renaming or deleting a request updates
   `.flow` references.
 - Running moves focus to the response pane (in Requests and in Flows); `escape`
@@ -190,10 +191,10 @@ Inspect one request:
 termurl show specs/get
 ```
 
-Request names are collection-relative paths without `.hurl`. The suffix is
-optional, so `specs/get` and `specs/get.hurl` identify the same request. An
-explicit `.hurl` file path inside the configured collection is also accepted.
-Directories are never executed implicitly.
+Request names are paths under `<collection>/requests` without `.hurl`. The
+suffix is optional, so `specs/get` and `specs/get.hurl` identify the same
+request. An explicit `.hurl` file path inside the requests directory (including
+`requests/<name>`) is also accepted. Directories are never executed implicitly.
 
 Inspect environments and variables:
 
@@ -263,22 +264,23 @@ tool calls without mixing diagnostics into response payloads.
 
 ## Collections
 
-A collection is a directory of Hurl files. There is one request per `.hurl`
-file:
+A collection is a directory holding a `requests/` tree of Hurl files and a
+`flows/` tree of saved flows. There is one request per `.hurl` file:
 
 ```text
 my-apis/
   .env.dev
   .env.prod
   .env.example         # template, skipped by environment discovery
+  requests/
+    specs/
+      get.hurl
+      list.hurl
   flows/
     auth-check.flow     # saved ordered group of requests
-  specs/
-    get.hurl
-    list.hurl
 ```
 
-The collection-relative file path becomes the request name. The first `#`
+The path under `requests/` becomes the request name. The first `#`
 comment becomes its description. Ordered groups can be run ad hoc as explicit
 arguments, or saved as [flows](#flows) for reuse from the TUI and the CLI.
 
@@ -387,8 +389,8 @@ edits the selected flow directly, with the `.flow` file as the source of truth:
   as a flow.
 
 The **Requests tab** uses the same keys: `a` creates a request or folder, `r`
-renames, and `d` deletes. Names are collection-relative, so `a` with `specs/`
-creates a folder and `specs/get` creates `specs/get.hurl`. Renaming or deleting
+renames, and `d` deletes. Names are relative to `requests/`, so `a` with `specs/`
+creates a folder and `specs/get` creates `requests/specs/get.hurl`. Renaming or deleting
 a request rewrites the corresponding step lines in every `.flow` file.
 
 

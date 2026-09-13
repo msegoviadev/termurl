@@ -26,9 +26,9 @@ newer, must be on `PATH`.
 - `termurl flows list --json` lists saved flows with their steps and descriptions.
 - `termurl flows show <name>` prints a flow file.
 
-Request names are the collection-relative path without `.hurl`, for example
-`specs/get`. A `.hurl` suffix is also accepted. Run requests explicitly, never
-by passing a directory.
+Request names are the path under `<collection>/requests` without `.hurl`, for
+example `specs/get`. A `.hurl` suffix is also accepted. Run requests explicitly,
+never by passing a directory.
 
 ## Run
 
