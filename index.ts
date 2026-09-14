@@ -2226,6 +2226,16 @@ function renderEnvironments() {
   });
 }
 
+// Moves the environment selection, blocking when a dirty buffer would be clobbered.
+function moveEnvironment(delta: number) {
+  const next = Math.max(0, Math.min(environments.length - 1, selectedEnvironment + delta));
+  if (next === selectedEnvironment) return;
+  if (envDirty() && environments[next] !== envLoadedName) { warnDirty(`.env.${envLoadedName}`); return; }
+  selectedEnvironment = next;
+  renderEnvironments();
+  loadEnvironmentFile();
+}
+
 function loadEnvironmentFile(force = false) {
   const name = environments[selectedEnvironment];
   if (!force && envDirty() && envLoadedName === name) {
@@ -3122,6 +3132,11 @@ function ensureSelectedRowVisible() {
   else if (selectedRow >= treeList.scrollTop + height) treeList.scrollTop = selectedRow - height + 1;
 }
 
+// Shift+J/K jump a quarter of the visible rows, matching the nvim quarter_page.
+function pageStep(height: number): number {
+  return Math.max(1, Math.floor(height / 4));
+}
+
 function renderTree() {
   const queueActive = flowQueue.size > 0;
 
@@ -3965,15 +3980,35 @@ function enterVisual(target: TextareaRenderable, kind: "char" | "line") {
 
 function applyVimMotion(target: TextareaRenderable, k: string, key: KeyEvent): boolean {
   const eb = target.editBuffer;
-  if (k === "h") eb.moveCursorLeft();
+  const shift = key.shift;
+  // shift+JK jump a quarter viewport, matching the nvim config's quarter_page.
+  const jumpLines = (direction: 1 | -1) => {
+    const step = Math.max(1, Math.floor(target.editorView.getViewport().height / 4));
+    for (let i = 0; i < step; i++) {
+      if (direction > 0) eb.moveCursorDown();
+      else eb.moveCursorUp();
+    }
+  };
+  const firstNonBlank = () => {
+    const row = eb.getCursorPosition().row;
+    const start = eb.getLineStartOffset(row);
+    const end = row + 1 < eb.getLineCount() ? eb.getLineStartOffset(row + 1) : target.plainText.length;
+    const match = eb.getTextRange(start, end).search(/\S/);
+    eb.setCursor(row, match < 0 ? 0 : match);
+  };
+  if (k === "J" || (k === "j" && shift)) jumpLines(1);
+  else if (k === "K" || (k === "k" && shift)) jumpLines(-1);
+  else if (k === "H" || (k === "h" && shift)) firstNonBlank();
+  else if (k === "L" || (k === "l" && shift)) { const e = eb.getEOL(); eb.setCursor(e.row, e.col); }
+  else if (k === "h") eb.moveCursorLeft();
   else if (k === "l") eb.moveCursorRight();
   else if (k === "j") eb.moveCursorDown();
   else if (k === "k") eb.moveCursorUp();
   else if (k === "w") { const c = eb.getNextWordBoundary(); eb.setCursor(c.row, c.col); }
   else if (k === "b") { const c = eb.getPrevWordBoundary(); eb.setCursor(c.row, c.col); }
   else if (k === "0") eb.setCursor(eb.getCursorPosition().row, 0);
-  else if (k === "$" || (k === "4" && key.shift)) { const e = eb.getEOL(); eb.setCursor(e.row, e.col); }
-  else if (k === "G" || (k === "g" && key.shift)) eb.gotoLine(eb.getLineCount() - 1);
+  else if (k === "$" || (k === "4" && shift)) { const e = eb.getEOL(); eb.setCursor(e.row, e.col); }
+  else if (k === "G" || (k === "g" && shift)) eb.gotoLine(eb.getLineCount() - 1);
   else return false;
   return true;
 }
@@ -4242,6 +4277,8 @@ function runCommandLine(cmd: string) {
 
 const VIM_MOVE: [string, string][] = [
   ["hjkl / w / b", "move / word forward / back"],
+  ["J / K", "quarter page down / up"],
+  ["H / L", "first non-blank / line end"],
   ["0 / $", "start / end of line"],
   ["gg / G", "top / bottom"],
 ];
@@ -4262,6 +4299,7 @@ const VIM_EDIT: [string, string][] = [
 const PANE_HELP: Record<string, [string, string][]> = {
   list: [
     ["j / k", "move down / up"],
+    ["J / K", "quarter page down / up"],
     ["gg / G", "jump to top / bottom"],
     ["/", "filter"],
     ["enter", "run queue / request / toggle folder"],
@@ -4306,6 +4344,7 @@ const PANE_HELP: Record<string, [string, string][]> = {
   ],
   "history-list": [
     ["j / k", "move"],
+    ["J / K", "quarter page down / up"],
     ["g / G", "jump to top / bottom"],
     ["enter / l / ctrl-l", "open details"],
     ["y", "copy all"],
@@ -4323,6 +4362,7 @@ const PANE_HELP: Record<string, [string, string][]> = {
   ],
   "env-list": [
     ["j / k", "move"],
+    ["J / K", "quarter page down / up"],
     ["enter", "activate environment"],
     ["l / ctrl-l", "open file for editing"],
     ["i", "open file and insert"],
@@ -4344,6 +4384,7 @@ const PANE_HELP: Record<string, [string, string][]> = {
   ],
   "flows-list": [
     ["j / k", "move"],
+    ["J / K", "quarter page down / up"],
     ["g / G", "jump to top / bottom"],
     ["/", "filter"],
     ["enter / l", "run flow / toggle folder"],
@@ -4363,7 +4404,6 @@ const PANE_HELP: Record<string, [string, string][]> = {
     ...VIM_EDIT,
     ["ctrl-a", "append selected request as a step"],
     [":add <request>", "append a step by name"],
-    ["J / K", "move current step down / up"],
     ["ctrl-s / :w", "save"],
     [":wq / :x", "save and close pane"],
     [":q / :q!", "close pane (bang discards changes)"],
@@ -4547,16 +4587,10 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
     if (key.ctrl && k === "l") { setEnvPane("editor"); return; }
     if (k === "l") { setEnvPane("editor"); return; }
     if (k === "escape" || k === "1") { setWindow("requests"); return; }
-    if (k === "j") {
-      const next = Math.min(environments.length - 1, selectedEnvironment + 1);
-      if (envDirty() && environments[next] !== envLoadedName) { warnDirty(`.env.${envLoadedName}`); return; }
-      selectedEnvironment = next; renderEnvironments(); loadEnvironmentFile(); return;
-    }
-    if (k === "k") {
-      const next = Math.max(0, selectedEnvironment - 1);
-      if (envDirty() && environments[next] !== envLoadedName) { warnDirty(`.env.${envLoadedName}`); return; }
-      selectedEnvironment = next; renderEnvironments(); loadEnvironmentFile(); return;
-    }
+    if (k === "J" || (k === "j" && key.shift)) { moveEnvironment(pageStep(envList.height)); return; }
+    if (k === "K" || (k === "k" && key.shift)) { moveEnvironment(-pageStep(envList.height)); return; }
+    if (k === "j") { moveEnvironment(1); return; }
+    if (k === "k") { moveEnvironment(-1); return; }
     if (k === "enter" || k === "return") {
       environmentIdx = selectedEnvironment;
       refreshEditorHighlights();
@@ -4581,8 +4615,6 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
       if ((k === "enter" || k === "return") && key.shift) { const flow = currentFlow(); if (flow) void runNamedFlow(flow, "flows"); return; }
       if (k === "escape") { setFlowPane("list"); return; }
       if (!visual && (k === ":" || (k === ";" && key.shift))) { enterCommandLine(); return; }
-      if (!visual && (k === "J" || (k === "j" && key.shift))) { moveFlowLine(1); return; }
-      if (!visual && (k === "K" || (k === "k" && key.shift))) { moveFlowLine(-1); return; }
       vimNormal(k, key, flowDetail, false, "flow");
       return;
     }
@@ -4609,6 +4641,8 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
       return;
     }
     if (k === "escape") { setWindow("requests"); return; }
+    if (k === "J" || (k === "j" && key.shift)) { moveFlowSelection(pageStep(flowList.height)); return; }
+    if (k === "K" || (k === "k" && key.shift)) { moveFlowSelection(-pageStep(flowList.height)); return; }
     if (k === "j") { moveFlowSelection(1); return; }
     if (k === "k") { moveFlowSelection(-1); return; }
     if (k === "g" && !key.shift) { moveFlowSelection(-selectedFlowRow); return; }
@@ -4638,6 +4672,8 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
     }
     if (k === "q") { quitApp(); return; }
     if (k === "escape") { setWindow("requests"); return; }
+    if (k === "J" || (k === "j" && key.shift)) { moveHistory(pageStep(historyList.height)); return; }
+    if (k === "K" || (k === "k" && key.shift)) { moveHistory(-pageStep(historyList.height)); return; }
     if (k === "j") { moveHistory(1); return; }
     if (k === "k") { moveHistory(-1); return; }
     if (key.ctrl && k === "l") { setHistoryPane("detail"); return; }
@@ -4682,6 +4718,8 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
       }
       return;
     }
+    if (k === "J" || (k === "j" && key.shift)) { moveSelection(pageStep(treeList.viewport.height)); return; }
+    if (k === "K" || (k === "k" && key.shift)) { moveSelection(-pageStep(treeList.viewport.height)); return; }
     if (k === "j") { moveSelection(1); return; }
     if (k === "k") { moveSelection(-1); return; }
     if (k === "L" || (k === "l" && key.shift)) {
