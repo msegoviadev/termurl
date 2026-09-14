@@ -1157,6 +1157,49 @@ type FlowRow =
 const flowCollapsed = new Set<string>();
 let flowRows: FlowRow[] = [];
 let selectedFlowRow = 0;
+
+// One cached TextRenderable per list row so a selection move only repaints the
+// two affected rows instead of rebuilding every row on each keypress. `key`
+// identifies the logical row at a slot, so the mouse handler is rebuilt only
+// when that row or its position changes. `contentKey` lets palette and file
+// changes still reach the cached views; a new StyledText (history rows) carries
+// theme colors, so those keys embed a palette generation.
+type ListRowView<T> = {
+  view: TextRenderable;
+  contentKey: string;
+  key: string;
+  index: number;
+  fg: string;
+  bg: string;
+  row: T | null;
+};
+
+function createRowView<T>(container: BoxRenderable): ListRowView<T> {
+  const view = new TextRenderable(renderer, {
+    content: "", width: "100%", height: 1, fg: C.fg, bg: C.bg, truncate: true, selectable: false,
+  });
+  container.add(view);
+  return { view, contentKey: "", key: "", index: -1, fg: "", bg: "", row: null };
+}
+
+// Grows or shrinks the cached row list to match `count`, rebuilding every view
+// only when the row count changes.
+function ensureRowViews<T>(views: ListRowView<T>[], count: number, container: BoxRenderable): ListRowView<T>[] {
+  if (views.length === count) return views;
+  clearChildren(container);
+  return Array.from({ length: count }, () => createRowView<T>(container));
+}
+
+type RowPaint<T> = { contentKey: string; content: string | StyledText; fg: string; bg: string; row: T | null };
+
+function paintRowView<T>(entry: ListRowView<T>, paint: RowPaint<T>) {
+  if (entry.contentKey !== paint.contentKey) { entry.view.content = paint.content; entry.contentKey = paint.contentKey; }
+  if (entry.fg !== paint.fg) { entry.view.fg = paint.fg; entry.fg = paint.fg; }
+  if (entry.bg !== paint.bg) { entry.view.bg = paint.bg; entry.bg = paint.bg; }
+  entry.row = paint.row;
+}
+
+let flowRowViews: ListRowView<FlowRow>[] = [];
 let flowInsert = false;
 let flowSavedText = "";
 let flowLoadedName: string | null = null;
@@ -1200,8 +1243,10 @@ type HistoryGroup = {
 };
 
 let historyGroups: HistoryGroup[] = [];
+let historyRowViews: ListRowView<HistoryGroup>[] = [];
 let selectedHistory = 0;
 let selectedEnvironment = 0;
+let envRowViews: ListRowView<string>[] = [];
 let secretsRevealed = false;
 
 type TreeRow =
@@ -1220,6 +1265,7 @@ const TREE_ROOT = "⌂";
 
 const collapsed = new Set<string>();
 let treeRows: TreeRow[] = [];
+let treeRowViews: ListRowView<TreeRow>[] = [];
 let selectedRow = 0;
 let lastRowClick = { index: -1, time: 0 };
 
@@ -2147,30 +2193,36 @@ function maskSecretsText(text: string): string {
 }
 
 function renderEnvironments() {
-  clearChildren(envList);
+  envRowViews = ensureRowViews(envRowViews, environments.length, envList);
   environments.forEach((environment, index) => {
     const active = index === environmentIdx;
     const selected = index === selectedEnvironment;
-    const rowRenderable = new TextRenderable(renderer, {
-      content: `${selected ? ">" : " "} ${environment}${active ? "  (active)" : ""}`,
-      width: "100%",
-      height: 1,
+    const content = `${selected ? ">" : " "} ${environment}${active ? "  (active)" : ""}`;
+    const key = `e:${environment}`;
+    const entry = envRowViews[index];
+    paintRowView(entry, {
+      contentKey: content,
+      content,
       fg: active ? C.green : C.fg,
       bg: selected ? C.selected : C.bg,
-      truncate: true,
-      selectable: false,
+      row: environment,
     });
-    rowRenderable.onMouseDown = () => {
-      if (appWindow === "environments" && envPane !== "list") setEnvPane("list");
-      if (envDirty() && environments[index] !== envLoadedName) {
-        warnDirty(`.env.${envLoadedName}`);
-        return;
-      }
-      selectedEnvironment = index;
-      renderEnvironments();
-      loadEnvironmentFile();
-    };
-    envList.add(rowRenderable);
+    if (entry.key !== key || entry.index !== index) {
+      entry.key = key;
+      entry.index = index;
+      entry.view.onMouseDown = () => {
+        const name = environments[index];
+        if (!name) return;
+        if (appWindow === "environments" && envPane !== "list") setEnvPane("list");
+        if (envDirty() && name !== envLoadedName) {
+          warnDirty(`.env.${envLoadedName}`);
+          return;
+        }
+        selectedEnvironment = index;
+        renderEnvironments();
+        loadEnvironmentFile();
+      };
+    }
   });
 }
 
@@ -2325,36 +2377,44 @@ function renderFlowList() {
     if (index >= 0) selectedFlowRow = index;
   }
   selectedFlowRow = Math.max(0, Math.min(selectedFlowRow, Math.max(0, flowRows.length - 1)));
-  clearChildren(flowList);
+
+  const query = flowFilterInput.value.trim();
+  const message = flowRows.length === 1
+    ? (query ? ` no flows match "${query}"` : " no flows yet, press a to create one")
+    : null;
+
+  flowRowViews = ensureRowViews(flowRowViews, flowRows.length + (message ? 1 : 0), flowList);
+
   flowRows.forEach((row, index) => {
-    const selected = index === selectedFlowRow;
+    const entry = flowRowViews[index];
     const content = row.type === "folder"
       ? `${"  ".repeat(row.depth)}${flowCollapsed.has(row.path) ? "▸" : "▾"} ${row.name}/`
       : `${"  ".repeat(row.depth + 1)}${flowLabel(row.flow)}`;
-    const rowRenderable = new TextRenderable(renderer, {
-      content,
-      width: "100%",
-      height: 1,
-      fg: C.fg,
-      bg: selected ? C.selected : C.bg,
-      truncate: true,
-      selectable: false,
-    });
-    rowRenderable.onMouseDown = () => {
-      if (appWindow === "flows" && flowPane !== "list") setFlowPane("list");
-      if (!selectFlowRow(index)) return;
-      if (row.type === "folder") { toggleFlowFolder(row.path); return; }
-      renderFlowList();
-      loadFlowFile();
-    };
-    flowList.add(rowRenderable);
+    const key = row.type === "folder" ? `d:${row.path}` : `w:${row.flow.name}`;
+    const bg = index === selectedFlowRow ? C.selected : C.bg;
+    paintRowView(entry, { contentKey: content, content, fg: C.fg, bg, row });
+    if (entry.key !== key || entry.index !== index) {
+      entry.key = key;
+      entry.index = index;
+      entry.view.onMouseDown = () => {
+        const current = flowRows[index];
+        if (!current) return;
+        if (appWindow === "flows" && flowPane !== "list") setFlowPane("list");
+        if (!selectFlowRow(index)) return;
+        if (current.type === "folder") { toggleFlowFolder(current.path); return; }
+        loadFlowFile();
+      };
+    }
   });
-  if (flowRows.length === 1) {
-    const query = flowFilterInput.value.trim();
-    flowList.add(new TextRenderable(renderer, {
-      content: query ? ` no flows match "${query}"` : " no flows yet, press a to create one",
-      width: "100%", height: 1, fg: C.dim, bg: C.bg, truncate: true, selectable: false,
-    }));
+
+  if (message) {
+    const entry = flowRowViews[flowRows.length];
+    paintRowView(entry, { contentKey: message, content: message, fg: C.dim, bg: C.bg, row: null });
+    if (entry.key !== "message") {
+      entry.key = "message";
+      entry.index = -1;
+      entry.view.onMouseDown = undefined;
+    }
   }
 }
 
@@ -2369,7 +2429,14 @@ function selectFlowRow(index: number): boolean {
       return false;
     }
   }
+  const previous = selectedFlowRow;
   selectedFlowRow = index;
+  if (previous !== index) {
+    const prev = flowRowViews[previous];
+    if (prev) { prev.view.bg = C.bg; prev.bg = C.bg; }
+    const curr = flowRowViews[index];
+    if (curr) { curr.view.bg = C.selected; curr.bg = C.selected; }
+  }
   return true;
 }
 
@@ -2378,7 +2445,6 @@ function moveFlowSelection(delta: number) {
   const next = Math.max(0, Math.min(flowRows.length - 1, selectedFlowRow + delta));
   if (next === selectedFlowRow) return;
   if (!selectFlowRow(next)) return;
-  renderFlowList();
   loadFlowFile();
 }
 
@@ -2759,10 +2825,22 @@ function historyDetailText(group: HistoryGroup | undefined): string {
 }
 
 let historyRenderedWidth = -1;
+// Bumped by applyPalette so cached StyledText history rows rebuild with the new theme.
+let paletteGeneration = 0;
+// Maps a history group index to the cached view slot that shows it.
+let historyGroupViews: number[] = [];
+
+function updateHistoryDetail() {
+  const group = historyGroups[selectedHistory];
+  const text = historyDetailText(group);
+  historyDetail.setText(text);
+  applyResponseHighlights(historyDetail, text, Boolean(group?.steps.some((step) => step.error || step.status >= 400)));
+}
 
 function renderHistory() {
   historyRenderedWidth = Math.floor(historyList.width);
-  clearChildren(historyList);
+  type Slot = { key: string; group: number | null; content: string | StyledText; contentKey: string; fg: string };
+  const slots: Slot[] = [];
   let lastDayKey = "";
   historyGroups.forEach((group, index) => {
     const dayKey = historyDayKey(group.ts);
@@ -2770,36 +2848,65 @@ function renderHistory() {
       lastDayKey = dayKey;
       const label = historyDayLabel(group.ts);
       const ruleWidth = Math.max(0, Math.floor(historyList.width || 20) - label.length - 4);
-      historyList.add(new TextRenderable(renderer, {
+      slots.push({
+        key: `h:${dayKey}`,
+        group: null,
         content: ` ${label} ${"─".repeat(ruleWidth)}`,
-        width: "100%",
-        height: 1,
+        contentKey: `${dayKey}|${ruleWidth}`,
         fg: C.dim,
-        bg: C.bg,
-        truncate: true,
-        selectable: false,
-      }));
+      });
     }
-    const rowRenderable = new TextRenderable(renderer, {
+    slots.push({
+      key: `g:${group.key}`,
+      group: index,
       content: historyTitle(group),
-      width: "100%",
-      height: 1,
+      contentKey: `${group.key}|${group.steps.length}|${group.ts}|${paletteGeneration}`,
       fg: C.fg,
-      bg: index === selectedHistory ? C.selected : C.bg,
-      truncate: true,
-      selectable: false,
     });
-    rowRenderable.onMouseDown = () => {
-      if (appWindow === "history" && historyPane !== "list") setHistoryPane("list");
-      selectedHistory = index;
-      renderHistory();
-    };
-    historyList.add(rowRenderable);
   });
-  const group = historyGroups[selectedHistory];
-  const text = historyDetailText(group);
-  historyDetail.setText(text);
-  applyResponseHighlights(historyDetail, text, Boolean(group?.steps.some((step) => step.error || step.status >= 400)));
+
+  historyRowViews = ensureRowViews(historyRowViews, slots.length, historyList);
+  historyGroupViews = new Array(historyGroups.length).fill(-1);
+
+  slots.forEach((slot, viewIndex) => {
+    const entry = historyRowViews[viewIndex];
+    const selected = slot.group !== null && slot.group === selectedHistory;
+    paintRowView(entry, {
+      contentKey: slot.contentKey,
+      content: slot.content,
+      fg: slot.fg,
+      bg: selected ? C.selected : C.bg,
+      row: slot.group === null ? null : historyGroups[slot.group],
+    });
+    if (slot.group !== null) historyGroupViews[slot.group] = viewIndex;
+    if (entry.key !== slot.key || entry.index !== viewIndex) {
+      entry.key = slot.key;
+      entry.index = viewIndex;
+      const groupIndex = slot.group;
+      entry.view.onMouseDown = groupIndex === null ? undefined : () => {
+        if (appWindow === "history" && historyPane !== "list") setHistoryPane("list");
+        selectHistoryRow(groupIndex);
+      };
+    }
+  });
+
+  updateHistoryDetail();
+}
+
+// Moves the history selection and repaints only the two affected group rows.
+function selectHistoryRow(index: number) {
+  if (!historyGroups[index]) return;
+  const previous = selectedHistory;
+  selectedHistory = index;
+  if (previous !== index) {
+    const prevView = historyGroupViews[previous];
+    const prev = prevView >= 0 ? historyRowViews[prevView] : undefined;
+    if (prev) { prev.view.bg = C.bg; prev.bg = C.bg; }
+    const currView = historyGroupViews[index];
+    const curr = currView >= 0 ? historyRowViews[currView] : undefined;
+    if (curr) { curr.view.bg = C.selected; curr.bg = C.selected; }
+  }
+  updateHistoryDetail();
 }
 
 function newHistoryGroup(key: string, record: HistoryRecord): HistoryGroup {
@@ -3016,51 +3123,73 @@ function ensureSelectedRowVisible() {
 }
 
 function renderTree() {
-  clearChildren(treeList);
-
   const queueActive = flowQueue.size > 0;
+
+  treeRowViews = ensureRowViews(treeRowViews, treeRows.length, treeList);
+
   treeRows.forEach((row, index) => {
-    const selected = index === selectedRow;
+    const entry = treeRowViews[index];
     const content = row.type === "folder"
       ? `${"  ".repeat(row.depth)}${collapsed.has(row.path) ? "▸" : "▾"} ${row.name}/`
       : `${"  ".repeat(row.depth + 1)}${requestLabel(row.req)}`;
     const isQueued = row.type === "request" && flowQueue.has(targetKey(row.req, currentVariant(row.req)));
     const rowColor = row.type === "folder" ? C.fg : methodColor(row.req.method);
-    const rowRenderable = new TextRenderable(renderer, {
-      content,
-      width: "100%",
-      height: 1,
-      fg: queueActive && !isQueued ? C.muted : rowColor,
-      bg: selected ? C.selected : C.bg,
-      truncate: true,
-      selectable: false,
-    });
-    rowRenderable.onMouseDown = () => {
-      if (appWindow === "requests" && pane !== "list") setPane("list");
-      const now = Date.now();
-      const doubleClick = lastRowClick.index === index && now - lastRowClick.time < 400;
-      lastRowClick = { index, time: now };
-      if (row.type === "request" && editorDirty() && editorEntry && row.req.name !== editorEntry.reqName) {
-        warnDirty(editorEntry.reqName);
-        return;
-      }
-      selectedRow = index;
-      if (row.type === "folder") {
-        if (row.path === "") toggleRequestRoot();
-        else toggleRequestFolder(row.path);
-        refreshList();
-        return;
-      }
-      if (doubleClick) {
-        toggleFlowRequest(row.req);
-        refreshList(row.req.name);
-        setStatus();
-        return;
-      }
-      moveSelection(0);
-    };
-    treeList.add(rowRenderable);
+    const fg = queueActive && !isQueued ? C.muted : rowColor;
+    const bg = index === selectedRow ? C.selected : C.bg;
+    const key = row.type === "folder" ? `d:${row.path}` : `r:${row.req.name}`;
+    paintRowView(entry, { contentKey: content, content, fg, bg, row });
+    if (entry.key !== key || entry.index !== index) {
+      entry.key = key;
+      entry.index = index;
+      entry.view.onMouseDown = () => {
+        const current = treeRows[index];
+        if (!current) return;
+        if (appWindow === "requests" && pane !== "list") setPane("list");
+        const now = Date.now();
+        const doubleClick = lastRowClick.index === index && now - lastRowClick.time < 400;
+        lastRowClick = { index, time: now };
+        if (current.type === "request" && editorDirty() && editorEntry && current.req.name !== editorEntry.reqName) {
+          warnDirty(editorEntry.reqName);
+          return;
+        }
+        if (current.type === "folder") {
+          selectedRow = index;
+          if (current.path === "") toggleRequestRoot();
+          else toggleRequestFolder(current.path);
+          refreshList();
+          return;
+        }
+        if (doubleClick) {
+          selectedRow = index;
+          toggleFlowRequest(current.req);
+          refreshList(current.req.name);
+          setStatus();
+          return;
+        }
+        selectRequestRow(index);
+      };
+    }
   });
+  ensureSelectedRowVisible();
+}
+
+// Moves the selection and repaints only the two affected rows.
+function selectRequestRow(index: number) {
+  const row = treeRows[index];
+  if (!row) return;
+  const targetName = row.type === "request" ? row.req.name : null;
+  if (editorDirty() && editorEntry && targetName !== editorEntry.reqName) {
+    warnDirty(editorEntry.reqName);
+    return;
+  }
+  const previous = selectedRow;
+  selectedRow = index;
+  const req = currentReq();
+  if (req) loadEditorEntry(req);
+  const prev = treeRowViews[previous];
+  if (prev && previous !== index) { prev.view.bg = C.bg; prev.bg = C.bg; }
+  const curr = treeRowViews[index];
+  if (curr) { curr.view.bg = C.selected; curr.bg = C.selected; }
   ensureSelectedRowVisible();
 }
 
@@ -3394,6 +3523,7 @@ function refreshPaneBorders() {
 
 function applyPalette() {
   Object.assign(C, resolvePalette(CONFIG));
+  paletteGeneration++;
   renderer.setBackgroundColor(C.bg);
   tabBar.bg = C.panel;
   statusBar.bg = C.panel;
@@ -3478,16 +3608,7 @@ function watchOmarchyTheme() {
 function moveSelection(delta: number) {
   if (treeRows.length === 0) return;
   const next = Math.max(0, Math.min(treeRows.length - 1, selectedRow + delta));
-  const targetRow = treeRows[next];
-  const targetName = targetRow?.type === "request" ? targetRow.req.name : null;
-  if (editorDirty() && editorEntry && targetName !== editorEntry.reqName) {
-    warnDirty(editorEntry.reqName);
-    return;
-  }
-  selectedRow = next;
-  const req = currentReq();
-  if (req) loadEditorEntry(req);
-  renderTree();
+  selectRequestRow(next);
 }
 
 function activateSelection() {
@@ -3696,8 +3817,7 @@ function setWindow(next: AppWindow) {
 
 function moveHistory(delta: number) {
   if (historyGroups.length === 0) return;
-  selectedHistory = Math.max(0, Math.min(historyGroups.length - 1, selectedHistory + delta));
-  renderHistory();
+  selectHistoryRow(Math.max(0, Math.min(historyGroups.length - 1, selectedHistory + delta)));
 }
 
 function indent(text: string): string {
@@ -4522,8 +4642,8 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
     if (k === "k") { moveHistory(-1); return; }
     if (key.ctrl && k === "l") { setHistoryPane("detail"); return; }
     if (k === "l") { setHistoryPane("detail"); return; }
-    if (k === "g") { selectedHistory = 0; renderHistory(); return; }
-    if (k === "G") { selectedHistory = Math.max(0, historyGroups.length - 1); renderHistory(); return; }
+    if (k === "g") { selectHistoryRow(0); return; }
+    if (k === "G") { selectHistoryRow(historyGroups.length - 1); return; }
     if (k === "enter" || k === "return") { setHistoryPane("detail"); return; }
     if (k === "y") {
       statusMsg = `copied history (${copyToClipboard(renderer, historyDetail.plainText)})`;
