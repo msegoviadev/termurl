@@ -1213,6 +1213,11 @@ type TreeNode = {
   requests: Req[];
 };
 
+// Synthetic row at the top of both file trees: a placeholder for the base
+// directory so `a` can create files there and `enter`/`l` can expand/collapse
+// every directory at once. Its path is the empty string.
+const TREE_ROOT = "⌂";
+
 const collapsed = new Set<string>();
 let treeRows: TreeRow[] = [];
 let selectedRow = 0;
@@ -2293,7 +2298,23 @@ function buildFlowTree(): FlowRow[] {
     }
   };
   walk(root, "", 0);
-  return rows;
+  return [{ type: "folder", path: "", name: TREE_ROOT, depth: 0 }, ...rows.map((row) => ({ ...row, depth: row.depth + 1 }))];
+}
+
+// Recursively toggles a flow folder and every directory beneath it; with path
+// "" this is the tree root (every directory).
+function toggleFlowSubtree(path: string) {
+  const scope = flowDirs.filter((dir) => path === "" || dir.startsWith(`${path}/`));
+  const expanded = !flowCollapsed.has(path) || scope.some((dir) => !flowCollapsed.has(dir));
+  for (const dir of [path, ...scope]) {
+    if (expanded) flowCollapsed.add(dir);
+    else flowCollapsed.delete(dir);
+  }
+}
+
+// Toggling the root collapses or expands every flow directory at once.
+function toggleFlowRoot() {
+  toggleFlowSubtree("");
 }
 
 function renderFlowList() {
@@ -2305,14 +2326,6 @@ function renderFlowList() {
   }
   selectedFlowRow = Math.max(0, Math.min(selectedFlowRow, Math.max(0, flowRows.length - 1)));
   clearChildren(flowList);
-  if (flowRows.length === 0) {
-    const query = flowFilterInput.value.trim();
-    flowList.add(new TextRenderable(renderer, {
-      content: query ? ` no flows match "${query}"` : " no flows yet, press a to create one",
-      width: "100%", height: 1, fg: C.dim, bg: C.bg, truncate: true, selectable: false,
-    }));
-    return;
-  }
   flowRows.forEach((row, index) => {
     const selected = index === selectedFlowRow;
     const content = row.type === "folder"
@@ -2336,6 +2349,13 @@ function renderFlowList() {
     };
     flowList.add(rowRenderable);
   });
+  if (flowRows.length === 1) {
+    const query = flowFilterInput.value.trim();
+    flowList.add(new TextRenderable(renderer, {
+      content: query ? ` no flows match "${query}"` : " no flows yet, press a to create one",
+      width: "100%", height: 1, fg: C.dim, bg: C.bg, truncate: true, selectable: false,
+    }));
+  }
 }
 
 // Returns false when a dirty flow buffer would be clobbered by the switch.
@@ -2362,8 +2382,17 @@ function moveFlowSelection(delta: number) {
   loadFlowFile();
 }
 
-function toggleFlowFolder(path: string) {
-  flowCollapsed.has(path) ? flowCollapsed.delete(path) : flowCollapsed.add(path);
+function toggleFlowFolder(path: string, recursive = false) {
+  if (recursive) {
+    toggleFlowSubtree(path);
+  } else if (path === "") {
+    toggleFlowRoot();
+  } else if (flowCollapsed.has(path)) {
+    flowCollapsed.delete(path);
+  } else {
+    flowCollapsed.add(path);
+    for (const dir of flowDirs) if (dir.startsWith(`${path}/`)) flowCollapsed.add(dir);
+  }
   flowRows = buildFlowTree();
   const index = flowRows.findIndex((row) => row.type === "folder" && row.path === path);
   if (index >= 0) selectedFlowRow = index;
@@ -2502,6 +2531,7 @@ function createFlowPath(value: string): boolean {
 function renameFlowPath(value: string): boolean {
   const row = currentFlowRow();
   if (!row) return false;
+  if (row.type === "folder" && row.path === "") { statusMsg = "cannot rename the root"; setStatus(); return false; }
   if (flowDirty()) { warnDirty(`flows/${flowLoadedName}`); return false; }
   const parsed = parseNameInput(value, ".flow");
   if ("error" in parsed) { statusMsg = parsed.error; setStatus(); return false; }
@@ -2533,6 +2563,7 @@ function renameFlowPath(value: string): boolean {
 function deleteFlowPath() {
   const row = currentFlowRow();
   if (!row) return;
+  if (row.type === "folder" && row.path === "") { statusMsg = "cannot delete the root"; setStatus(); return; }
   if (flowDirty() && flowLoadedName !== null && (row.type === "flow" ? row.flow.name === flowLoadedName : flowLoadedName.startsWith(`${row.path}/`))) {
     warnDirty(`flows/${flowLoadedName}`);
     return;
@@ -2576,7 +2607,7 @@ function submitFlowName(value: string) {
 function flowCreatePrefill(): string {
   const row = currentFlowRow();
   if (!row) return "";
-  if (row.type === "folder") return `${row.path}/`;
+  if (row.type === "folder") return row.path ? `${row.path}/` : "";
   const at = row.flow.name.lastIndexOf("/");
   return at > 0 ? row.flow.name.slice(0, at + 1) : "";
 }
@@ -2584,6 +2615,7 @@ function flowCreatePrefill(): string {
 function showFlowRenameInput() {
   const row = currentFlowRow();
   if (!row) return;
+  if (row.type === "folder" && row.path === "") { statusMsg = "cannot rename the root"; setStatus(); return; }
   showFlowNameInput("rename", row.type === "folder" ? row.path : row.flow.name);
 }
 
@@ -2942,6 +2974,40 @@ function flattenTree(node: TreeNode, parentPath = "", depth = 0): TreeRow[] {
   return rows;
 }
 
+function requestTreeRows(list: Req[], dirs: string[]): TreeRow[] {
+  const children = flattenTree(buildTree(list, dirs), "", 0);
+  return [{ type: "folder", path: "", name: TREE_ROOT, depth: 0 }, ...children.map((row) => ({ ...row, depth: row.depth + 1 }))];
+}
+
+// Recursively toggles a folder and every directory beneath it: if anything in
+// the subtree is expanded it collapses the whole subtree, otherwise it expands
+// it. With path "" this is the tree root (every directory).
+function toggleRequestSubtree(path: string) {
+  const scope = requestDirs.filter((dir) => path === "" || dir.startsWith(`${path}/`));
+  const expanded = !collapsed.has(path) || scope.some((dir) => !collapsed.has(dir));
+  for (const dir of [path, ...scope]) {
+    if (expanded) collapsed.add(dir);
+    else collapsed.delete(dir);
+  }
+}
+
+// Toggling the root collapses or expands every directory at once; the marker
+// lives on the empty-string path.
+function toggleRequestRoot() {
+  toggleRequestSubtree("");
+}
+
+// Collapsing a folder also collapses its subtree, so re-expanding shows the
+// nested folders collapsed by default.
+function toggleRequestFolder(path: string) {
+  if (collapsed.has(path)) {
+    collapsed.delete(path);
+    return;
+  }
+  collapsed.add(path);
+  for (const dir of requestDirs) if (dir.startsWith(`${path}/`)) collapsed.add(dir);
+}
+
 function ensureSelectedRowVisible() {
   const height = treeList.viewport.height;
   if (height <= 0) return;
@@ -2980,7 +3046,8 @@ function renderTree() {
       }
       selectedRow = index;
       if (row.type === "folder") {
-        collapsed.has(row.path) ? collapsed.delete(row.path) : collapsed.add(row.path);
+        if (row.path === "") toggleRequestRoot();
+        else toggleRequestFolder(row.path);
         refreshList();
         return;
       }
@@ -3010,7 +3077,7 @@ function refreshList(keepName?: string, touchEditor = true) {
     }
     dirs = requestDirs.filter((dir) => needed.has(dir));
   }
-  treeRows = flattenTree(buildTree(filtered, dirs));
+  treeRows = requestTreeRows(filtered, dirs);
   const targetName = keepName ?? previous;
   if (targetName) {
     const idx = treeRows.findIndex((row) => row.type === "request" && row.req.name === targetName);
@@ -3150,6 +3217,7 @@ function createRequestPath(value: string): boolean {
 function renameRequestPath(value: string): boolean {
   const row = currentTreeRow();
   if (!row) return false;
+  if (row.type === "folder" && row.path === "") { statusMsg = "cannot rename the root"; setStatus(); return false; }
   const touchesDirty = editorDirty() && editorEntry && (row.type === "request" ? row.req.name === editorEntry.reqName : editorEntry.reqName.startsWith(`${row.path}/`));
   if (touchesDirty) { warnDirty(editorEntry!.reqName); return false; }
   const parsed = parseNameInput(value, ".hurl");
@@ -3191,6 +3259,7 @@ function renameRequestPath(value: string): boolean {
 function deleteRequestPath() {
   const row = currentTreeRow();
   if (!row) return;
+  if (row.type === "folder" && row.path === "") { statusMsg = "cannot delete the root"; setStatus(); return; }
   if (row.type === "folder") {
     if (editorDirty() && editorEntry && editorEntry.reqName.startsWith(`${row.path}/`)) {
       warnDirty(editorEntry.reqName);
@@ -3245,7 +3314,7 @@ function submitRequestName(value: string) {
 function requestCreatePrefill(): string {
   const row = currentTreeRow();
   if (!row) return "";
-  if (row.type === "folder") return `${row.path}/`;
+  if (row.type === "folder") return row.path ? `${row.path}/` : "";
   const at = row.req.name.lastIndexOf("/");
   return at > 0 ? row.req.name.slice(0, at + 1) : "";
 }
@@ -3253,6 +3322,7 @@ function requestCreatePrefill(): string {
 function showRequestRenameInput() {
   const row = currentTreeRow();
   if (!row) return;
+  if (row.type === "folder" && row.path === "") { statusMsg = "cannot rename the root"; setStatus(); return; }
   showRequestNameInput("rename", row.type === "folder" ? row.path : row.req.name);
 }
 
@@ -3266,12 +3336,14 @@ function requestDelete(label: string, confirm: () => void) {
 function requestDeleteSelection() {
   const row = currentTreeRow();
   if (!row) return;
+  if (row.type === "folder" && row.path === "") { statusMsg = "cannot delete the root"; setStatus(); return; }
   requestDelete(row.type === "folder" ? `${row.path}/` : row.req.name, () => deleteRequestPath());
 }
 
 function flowDeleteSelection() {
   const row = currentFlowRow();
   if (!row) return;
+  if (row.type === "folder" && row.path === "") { statusMsg = "cannot delete the root"; setStatus(); return; }
   requestDelete(row.type === "folder" ? `flows/${row.path}/` : `flows/${row.flow.name}`, () => deleteFlowPath());
 }
 
@@ -3422,7 +3494,8 @@ function activateSelection() {
   const row = treeRows[selectedRow];
   if (!row) return;
   if (row.type === "folder") {
-    collapsed.has(row.path) ? collapsed.delete(row.path) : collapsed.add(row.path);
+    if (row.path === "") toggleRequestRoot();
+    else toggleRequestFolder(row.path);
     refreshList();
     return;
   }
@@ -4073,6 +4146,7 @@ const PANE_HELP: Record<string, [string, string][]> = {
     ["/", "filter"],
     ["enter", "run queue / request / toggle folder"],
     ["l", "toggle folder / open request pane"],
+    ["shift-l", "expand/collapse all subfolders"],
     ["ctrl-g / :flows", "run a saved flow"],
     ["tab", "queue/unqueue for flow"],
     ["shift-tab", "clear queue"],
@@ -4153,6 +4227,7 @@ const PANE_HELP: Record<string, [string, string][]> = {
     ["g / G", "jump to top / bottom"],
     ["/", "filter"],
     ["enter / l", "run flow / toggle folder"],
+    ["shift-l", "expand/collapse all subfolders"],
     ["ctrl-f / shift-enter", "run flow"],
     ["i / ctrl-l", "open flow editor"],
     ["a", "new flow/folder"],
@@ -4402,6 +4477,11 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
     if (!visual && (k === ":" || (k === ";" && key.shift))) { enterCommandLine(); return; }
     if (k === "/") { flowFilterInput.focus(); return; }
     if (key.ctrl && k === "l") { setFlowPane("editor"); return; }
+    if (k === "L" || (k === "l" && key.shift)) {
+      const row = currentFlowRow();
+      if (row?.type === "folder") toggleFlowFolder(row.path, true);
+      return;
+    }
     if (k === "l") {
       const row = currentFlowRow();
       if (row?.type === "folder") toggleFlowFolder(row.path);
@@ -4484,10 +4564,16 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
     }
     if (k === "j") { moveSelection(1); return; }
     if (k === "k") { moveSelection(-1); return; }
+    if (k === "L" || (k === "l" && key.shift)) {
+      const row = treeRows[selectedRow];
+      if (row?.type === "folder") { toggleRequestSubtree(row.path); refreshList(); }
+      return;
+    }
     if (k === "l") {
       const row = treeRows[selectedRow];
       if (row?.type === "folder") {
-        collapsed.has(row.path) ? collapsed.delete(row.path) : collapsed.add(row.path);
+        if (row.path === "") toggleRequestRoot();
+        else toggleRequestFolder(row.path);
         refreshList();
       } else if (row) {
         setPane("editor");
