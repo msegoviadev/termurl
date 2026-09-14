@@ -174,6 +174,7 @@ type Palette = {
   bg: string;
   fg: string;
   dim: string;
+  muted: string;
   yellow: string;
   green: string;
   red: string;
@@ -190,6 +191,7 @@ const DEFAULT_PALETTE: Palette = {
   bg: "#1a1b26",
   fg: "#c0caf5",
   dim: "#565f89",
+  muted: "#666666",
   yellow: "#e0af68",
   green: "#9ece6a",
   red: "#f7768e",
@@ -204,6 +206,17 @@ const DEFAULT_PALETTE: Palette = {
 
 const OMARCHY_COLORS_FILE = join(process.env.XDG_STATE_HOME ?? join(homedir(), ".local/state"), "omarchy", "current", "theme", "colors.toml");
 
+// Neutral grey between the background and foreground, used to de-emphasise rows
+// (matches the muted input-placeholder look, but adapts to light/dark themes).
+function neutralGrey(bg: string, fg: string, t = 0.45): string {
+  const rgb = (value: string) => [1, 3, 5].map((i) => parseInt(value.slice(i, i + 2), 16));
+  const a = rgb(bg);
+  const b = rgb(fg);
+  const grey = Math.round(a.reduce((sum, channel, i) => sum + channel + (b[i] - channel) * t, 0) / 3);
+  const hex = Math.max(0, Math.min(255, grey)).toString(16).padStart(2, "0");
+  return `#${hex}${hex}${hex}`;
+}
+
 function loadOmarchyPalette(): Palette | null {
   if (process.platform !== "linux") return null;
   let colors: Record<string, string>;
@@ -213,10 +226,13 @@ function loadOmarchyPalette(): Palette | null {
     return null;
   }
   const hex = (value: string | undefined, fallback: string) => (value && /^#[0-9a-fA-F]{6}$/.test(value) ? value : fallback);
+  const bg = hex(colors.background, DEFAULT_PALETTE.bg);
+  const fg = hex(colors.bright_foreground, DEFAULT_PALETTE.fg);
   return {
-    bg: hex(colors.background, DEFAULT_PALETTE.bg),
-    fg: hex(colors.bright_foreground, DEFAULT_PALETTE.fg),
+    bg,
+    fg,
     dim: hex(colors.dark_foreground, DEFAULT_PALETTE.dim),
+    muted: neutralGrey(bg, fg),
     yellow: hex(colors.yellow, DEFAULT_PALETTE.yellow),
     green: hex(colors.green, DEFAULT_PALETTE.green),
     red: hex(colors.red, DEFAULT_PALETTE.red),
@@ -2864,6 +2880,19 @@ function toggleFlowRequest(req: Req) {
   normalizeFlowQueue();
 }
 
+function clearQueue() {
+  const count = flowQueue.size;
+  if (count === 0) {
+    statusMsg = "queue is already empty";
+    setStatus();
+    return;
+  }
+  flowQueue.clear();
+  refreshList(currentReq()?.name);
+  statusMsg = `cleared ${count} queued request${count === 1 ? "" : "s"}`;
+  setStatus();
+}
+
 // Writes the current queue, in order, as a .flow file under flows/. The name is
 // sanitized to keep it inside the flows directory; refuses to overwrite unless
 // force is set.
@@ -2923,16 +2952,19 @@ function ensureSelectedRowVisible() {
 function renderTree() {
   clearChildren(treeList);
 
+  const queueActive = flowQueue.size > 0;
   treeRows.forEach((row, index) => {
     const selected = index === selectedRow;
     const content = row.type === "folder"
       ? `${"  ".repeat(row.depth)}${collapsed.has(row.path) ? "▸" : "▾"} ${row.name}/`
       : `${"  ".repeat(row.depth + 1)}${requestLabel(row.req)}`;
+    const isQueued = row.type === "request" && flowQueue.has(targetKey(row.req, currentVariant(row.req)));
+    const rowColor = row.type === "folder" ? C.fg : methodColor(row.req.method);
     const rowRenderable = new TextRenderable(renderer, {
       content,
       width: "100%",
       height: 1,
-      fg: row.type === "folder" ? C.fg : methodColor(row.req.method),
+      fg: queueActive && !isQueued ? C.muted : rowColor,
       bg: selected ? C.selected : C.bg,
       truncate: true,
       selectable: false,
@@ -4039,11 +4071,11 @@ const PANE_HELP: Record<string, [string, string][]> = {
     ["j / k", "move down / up"],
     ["gg / G", "jump to top / bottom"],
     ["/", "filter"],
-    ["enter", "run request / toggle folder"],
+    ["enter", "run queue / request / toggle folder"],
     ["l", "toggle folder / open request pane"],
-    ["shift-enter / ctrl-f", "run flow"],
     ["ctrl-g / :flows", "run a saved flow"],
     ["tab", "queue/unqueue for flow"],
+    ["shift-tab", "clear queue"],
     [":saveflow <name>", "save queue as a flow"],
     ["v / ]", "next variant"],
     ["[", "previous variant"],
@@ -4464,14 +4496,17 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
     }
     if (k === "g" && !key.shift) { pending = "g"; setStatus(); return; }
     if (k === "G" || (k === "g" && key.shift)) { selectedRow = Math.max(0, treeRows.length - 1); renderTree(); return; }
-    if ((k === "enter" || k === "return") && key.shift) { runFlow(); return; }
-    if (k === "enter" || k === "return") { activateSelection(); return; }
+    if (k === "enter" || k === "return") {
+      if (flowQueue.size > 0) void runFlow();
+      else activateSelection();
+      return;
+    }
+    if (k === "tab" && key.shift) { clearQueue(); return; }
     if (k === "tab") {
       const r = currentReq();
       if (r) { toggleFlowRequest(r); refreshList(r.name); setStatus(); }
       return;
     }
-    if (k === "f" && key.ctrl) { runFlow(); return; }
     if (k === "g" && key.ctrl) { showFlowPicker(); return; }
     if (k === "i") { setPane("editor"); enterInsert(); return; }
     if (k === "v") { cycleVariant(1); return; }
