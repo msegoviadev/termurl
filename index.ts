@@ -2695,7 +2695,10 @@ function historyDetailText(group: HistoryGroup | undefined): string {
   return lines.join("\n");
 }
 
+let historyRenderedWidth = -1;
+
 function renderHistory() {
+  historyRenderedWidth = Math.floor(historyList.width);
   clearChildren(historyList);
   let lastDayKey = "";
   historyGroups.forEach((group, index) => {
@@ -4591,6 +4594,7 @@ renderer.on("frame" as any, () => {
   }
   refreshGutters();
   renderCommandLine();
+  if (appWindow === "history" && Math.floor(historyList.width) !== historyRenderedWidth) renderHistory();
 });
 renderer.on("resize" as any, () => {
   editorBox.height = `${editorSplit}%`;
