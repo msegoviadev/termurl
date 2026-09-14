@@ -1471,6 +1471,9 @@ const flowList = new BoxRenderable(renderer, {
   backgroundColor: C.bg,
 });
 
+const flowFilterInput = new InputRenderable(renderer, { placeholder: "/ filter", backgroundColor: "transparent", textColor: C.fg });
+flowListBox.add(flowFilterInput);
+
 const flowNameInput = new InputRenderable(renderer, {
   placeholder: "name (end with / for a folder)",
   backgroundColor: "transparent",
@@ -2255,8 +2258,13 @@ function buildFlowTree(): FlowRow[] {
     }
     return node;
   };
-  for (const dir of flowDirs) ensure(dir.split("/"));
-  for (const flow of flows) ensure(flow.name.split("/").slice(0, -1)).flows.push(flow);
+  const query = flowFilterInput.value.trim().toLowerCase();
+  const visibleFlows = query ? flows.filter((flow) => flow.name.toLowerCase().includes(query)) : flows;
+  const visibleDirs = query
+    ? flowDirs.filter((dir) => visibleFlows.some((flow) => flow.name.startsWith(`${dir}/`)))
+    : flowDirs;
+  for (const dir of visibleDirs) ensure(dir.split("/"));
+  for (const flow of visibleFlows) ensure(flow.name.split("/").slice(0, -1)).flows.push(flow);
   const rows: FlowRow[] = [];
   const walk = (node: Node, path: string, depth: number) => {
     for (const [name, child] of [...node.folders.entries()].sort(([a], [b]) => a.localeCompare(b))) {
@@ -2273,12 +2281,18 @@ function buildFlowTree(): FlowRow[] {
 }
 
 function renderFlowList() {
+  const selectedName = currentFlow()?.name;
   flowRows = buildFlowTree();
+  if (selectedName) {
+    const index = flowRows.findIndex((row) => row.type === "flow" && row.flow.name === selectedName);
+    if (index >= 0) selectedFlowRow = index;
+  }
   selectedFlowRow = Math.max(0, Math.min(selectedFlowRow, Math.max(0, flowRows.length - 1)));
   clearChildren(flowList);
   if (flowRows.length === 0) {
+    const query = flowFilterInput.value.trim();
     flowList.add(new TextRenderable(renderer, {
-      content: " no flows yet, press a to create one",
+      content: query ? ` no flows match "${query}"` : " no flows yet, press a to create one",
       width: "100%", height: 1, fg: C.dim, bg: C.bg, truncate: true, selectable: false,
     }));
     return;
@@ -2398,6 +2412,7 @@ function setFlowPane(next: FlowPane) {
   commandBuffer = null;
   pendingDelete = null;
   flowInsert = false;
+  flowFilterInput.blur();
   flowPane = next;
   refreshPaneBorders();
   loadFlowFile();
@@ -3287,6 +3302,7 @@ function applyPalette() {
   flowDetailGutter.fg = C.dim;
   flowDetailGutter.bg = C.bg;
   filterInput.textColor = C.fg;
+  flowFilterInput.textColor = C.fg;
   requestNameInput.textColor = C.fg;
   flowNameInput.textColor = C.fg;
   helpOverlay.borderColor = C.yellow;
@@ -3409,17 +3425,6 @@ function yankNativeSelection(target: TextareaRenderable): boolean {
   return true;
 }
 
-function scrollText(target: TextareaRenderable, delta: number) {
-  const viewport = target.editorView.getViewport();
-  target.editorView.setViewport(
-    viewport.offsetX,
-    Math.max(0, viewport.offsetY + delta),
-    viewport.width,
-    viewport.height,
-    false,
-  );
-}
-
 function ensureCursorVisible(target: TextareaRenderable) {
   const view = target.editorView;
   const viewport = view.getViewport();
@@ -3537,6 +3542,7 @@ function setWindow(next: AppWindow) {
   clearVisual();
   endDividerDrag();
   filterInput.blur();
+  flowFilterInput.blur();
   commandBuffer = null;
   pendingDelete = null;
   editor.blur();
@@ -3765,11 +3771,6 @@ function moveVisual(target: TextareaRenderable, k: string, key: KeyEvent): boole
     setStatus();
     return true;
   }
-  if (key.ctrl && (k === "d" || k === "u")) {
-    scrollText(target, k === "d" ? 5 : -5);
-    setStatus();
-    return true;
-  }
   if (applyVimMotion(target, k, key)) {
     ensureCursorVisible(target);
     updateVisualSelection(target);
@@ -3840,7 +3841,6 @@ function vimNormal(k: string, key: KeyEvent, target: TextareaRenderable = editor
   else if (!readOnly && (k === "I" || (k === "i" && shift))) { eb.setCursor(eb.getCursorPosition().row, 0); startInsert(); }
   else if (!readOnly && k === "o" && !shift) { const e = eb.getEOL(); eb.setCursor(e.row, e.col); startInsert(); eb.newLine(); }
   else if (!readOnly && (k === "O" || (k === "o" && shift))) { eb.setCursor(eb.getCursorPosition().row, 0); startInsert(); eb.newLine(); eb.moveCursorUp(); }
-  else if (key.ctrl && (k === "d" || k === "u")) scrollText(target, k === "d" ? 5 : -5);
   else if (!applyVimMotion(target, k, key)) {
     if (k === "g" || k === "y" || (!readOnly && (k === "d" || k === "c"))) pending = k;
     else if (k === "Y" || (k === "y" && shift)) {
@@ -4019,7 +4019,6 @@ const VIM_MOVE: [string, string][] = [
   ["hjkl / w / b", "move / word forward / back"],
   ["0 / $", "start / end of line"],
   ["gg / G", "top / bottom"],
-  ["ctrl-d / ctrl-u", "page down / up"],
 ];
 
 const VIM_EDIT: [string, string][] = [
@@ -4039,7 +4038,6 @@ const PANE_HELP: Record<string, [string, string][]> = {
   list: [
     ["j / k", "move down / up"],
     ["gg / G", "jump to top / bottom"],
-    ["ctrl-d / ctrl-u", "page down / up"],
     ["/", "filter"],
     ["enter", "run request / toggle folder"],
     ["l", "toggle folder / open request pane"],
@@ -4049,13 +4047,12 @@ const PANE_HELP: Record<string, [string, string][]> = {
     [":saveflow <name>", "save queue as a flow"],
     ["v / ]", "next variant"],
     ["[", "previous variant"],
-    ["e / i / ctrl-l", "open request pane"],
+    ["i / ctrl-l", "open request pane"],
     ["a", "new request/folder"],
     ["r", "rename request/folder"],
     ["d", "delete request/folder (asks to confirm)"],
     ["y", "copy as hurl"],
     ["Y", "copy as curl"],
-    ["ctrl-p", "cycle environment"],
     ["alt+hjkl / alt-0", "resize panes / reset"],
     ["q", "quit"],
   ],
@@ -4078,14 +4075,12 @@ const PANE_HELP: Record<string, [string, string][]> = {
     ["c", "copy mouse selection"],
     ["s", "save body to file"],
     ["alt+hjkl / alt-0", "resize panes / reset"],
-    ["ctrl-p", "cycle environment"],
     ["ctrl-h", "back to request pane"],
     ["esc", "cancel visual"],
   ],
   "history-list": [
     ["j / k", "move"],
     ["g / G", "jump to top / bottom"],
-    ["ctrl-d / ctrl-u", "jump 5 up / down"],
     ["enter / l / ctrl-l", "open details"],
     ["y", "copy all"],
     ["alt+hl / alt-0", "resize sidebar / reset"],
@@ -4103,7 +4098,7 @@ const PANE_HELP: Record<string, [string, string][]> = {
   "env-list": [
     ["j / k", "move"],
     ["enter", "activate environment"],
-    ["e / l / ctrl-l", "open file for editing"],
+    ["l / ctrl-l", "open file for editing"],
     ["i", "open file and insert"],
     ["ctrl-r", "reveal/mask secrets"],
     ["alt+hl / alt-0", "resize sidebar / reset"],
@@ -4124,9 +4119,10 @@ const PANE_HELP: Record<string, [string, string][]> = {
   "flows-list": [
     ["j / k", "move"],
     ["g / G", "jump to top / bottom"],
+    ["/", "filter"],
     ["enter / l", "run flow / toggle folder"],
     ["ctrl-f / shift-enter", "run flow"],
-    ["e / i / ctrl-l", "open flow editor"],
+    ["i / ctrl-l", "open flow editor"],
     ["a", "new flow/folder"],
     ["r", "rename flow/folder"],
     ["d", "delete flow/folder (asks to confirm)"],
@@ -4232,6 +4228,7 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
   }
   if (helpVisible) { hideHelp(); setStatus(); key.preventDefault(); return; }
   if (filterInputFocused() && k === "escape") { filterInput.blur(); setPane("list"); key.preventDefault(); return; }
+  if (flowFilterInputFocused() && k === "escape") { flowFilterInput.blur(); setFlowPane("list"); key.preventDefault(); return; }
   if (commandBuffer !== null) {
     if (k === "escape") { commandBuffer = null; setStatus(); }
     else if (k === "return" || k === "enter") { const cmd = commandBuffer; commandBuffer = null; runCommandLine(cmd); setStatus(); }
@@ -4264,9 +4261,9 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
     key.preventDefault();
     return;
   }
-  if (k === "?" && !insert && !envInsert && !flowInsert && !filterInputFocused()) { showHelp(); key.preventDefault(); return; }
+  if (k === "?" && !insert && !envInsert && !flowInsert && !filterInputFocused() && !flowFilterInputFocused()) { showHelp(); key.preventDefault(); return; }
 
-  if (insert || envInsert || flowInsert || filterInputFocused()) { handleInputShortcut(key, k); return; }
+  if (insert || envInsert || flowInsert || filterInputFocused() || flowFilterInputFocused()) { handleInputShortcut(key, k); return; }
   key.preventDefault();
 
   if (!visual && !pending) {
@@ -4341,7 +4338,6 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
       setStatus();
       return;
     }
-    if (k === "e") { setEnvPane("editor"); return; }
     if (k === "i") { setEnvPane("editor"); enterEnvInsert(); return; }
     if (k === "r" && key.ctrl) { secretsRevealed = !secretsRevealed; renderEnvironments(); loadEnvironmentFile(); return; }
     return;
@@ -4372,6 +4368,7 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
       return;
     }
     if (!visual && (k === ":" || (k === ";" && key.shift))) { enterCommandLine(); return; }
+    if (k === "/") { flowFilterInput.focus(); return; }
     if (key.ctrl && k === "l") { setFlowPane("editor"); return; }
     if (k === "l") {
       const row = currentFlowRow();
@@ -4392,7 +4389,7 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
       return;
     }
     if (key.ctrl && k === "f") { const flow = currentFlow(); if (flow) void runNamedFlow(flow, "flows"); return; }
-    if (k === "e" || k === "i") { if (currentFlow()) { setFlowPane("editor"); if (k === "i") enterFlowInsert(); } return; }
+    if (k === "i") { if (currentFlow()) { setFlowPane("editor"); enterFlowInsert(); } return; }
     if (k === "a") { showFlowNameInput("create", flowCreatePrefill()); return; }
     if (k === "r") { showFlowRenameInput(); return; }
     if (k === "d") { flowDeleteSelection(); return; }
@@ -4411,8 +4408,6 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
     if (k === "escape") { setWindow("requests"); return; }
     if (k === "j") { moveHistory(1); return; }
     if (k === "k") { moveHistory(-1); return; }
-    if (key.ctrl && k === "d") { moveHistory(5); return; }
-    if (key.ctrl && k === "u") { moveHistory(-5); return; }
     if (key.ctrl && k === "l") { setHistoryPane("detail"); return; }
     if (k === "l") { setHistoryPane("detail"); return; }
     if (k === "g") { selectedHistory = 0; renderHistory(); return; }
@@ -4443,13 +4438,6 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
   if (k === "h" && key.ctrl) { setPane(pane === "response" ? "editor" : "list"); return; }
   if (visual && k === "escape") { clearVisual(); setStatus(); return; }
   if (k === "escape") { setPane("list"); return; }
-  if (k === "p" && key.ctrl) {
-    environmentIdx = (environmentIdx + 1) % environments.length;
-    selectedEnvironment = environmentIdx;
-    refreshEditorHighlights();
-    setStatus();
-    return;
-  }
 
   if (pane === "list") {
     if (k === "/" ) { filterInput.focus(); return; }
@@ -4462,8 +4450,6 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
       }
       return;
     }
-    if (key.ctrl && k === "d") { moveSelection(5); return; }
-    if (key.ctrl && k === "u") { moveSelection(-5); return; }
     if (k === "j") { moveSelection(1); return; }
     if (k === "k") { moveSelection(-1); return; }
     if (k === "l") {
@@ -4487,7 +4473,6 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
     }
     if (k === "f" && key.ctrl) { runFlow(); return; }
     if (k === "g" && key.ctrl) { showFlowPicker(); return; }
-    if (k === "e") { setPane("editor"); return; }
     if (k === "i") { setPane("editor"); enterInsert(); return; }
     if (k === "v") { cycleVariant(1); return; }
     if (k === "[") { cycleVariant(-1); return; }
@@ -4530,6 +4515,8 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
 
 function filterInputFocused() { return (filterInput as any).focused === true; }
 filterInput.on("input" as any, () => refreshList());
+function flowFilterInputFocused() { return (flowFilterInput as any).focused === true; }
+flowFilterInput.on("input" as any, () => { renderFlowList(); if (!flowDirty()) loadFlowFile(); });
 editor.onContentChange = () => {
   refreshEditorHighlights();
   syncModeTitles();
