@@ -2,6 +2,18 @@
 
 All notable changes to termurl are documented here.
 
+## [0.6.0](https://github.com/msegoviadev/termurl/compare/v0.5.0...v0.6.0) (2026-09-14)
+
+
+### Features
+
+* add quarter-page and line-edge shift motions ([54f69d5](https://github.com/msegoviadev/termurl/commit/54f69d500fc2c4b2df41719a9e7a6bc32906b067))
+
+
+### Performance Improvements
+
+* cache row renderables so selection moves repaint only two rows ([0741c7e](https://github.com/msegoviadev/termurl/commit/0741c7e30a25fc54118a97264f464b92f20ffa7c))
+
 ## [0.5.0](https://github.com/msegoviadev/termurl/compare/v0.4.0...v0.5.0) (2026-09-14)
 
 
