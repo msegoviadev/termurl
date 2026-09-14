@@ -2,6 +2,26 @@
 
 All notable changes to termurl are documented here.
 
+## [0.5.0](https://github.com/msegoviadev/termurl/compare/v0.4.0...v0.5.0) (2026-09-14)
+
+
+### Features
+
+* add a filter to the flows list and drop unused shortcuts ([70cc263](https://github.com/msegoviadev/termurl/commit/70cc263e78f682ca7973e6e62371682a6d4d8fcb))
+* add a root node to the file trees with recursive folder toggles ([ebc24de](https://github.com/msegoviadev/termurl/commit/ebc24de85eb96b8a8508a9b7dcab77f9c85d78e8))
+* add named flows and unified request/flow file management ([6ed2928](https://github.com/msegoviadev/termurl/commit/6ed292827366a82d0c124610e532733b3f796570))
+* color request rows by HTTP method and simplify list labels ([74767c7](https://github.com/msegoviadev/termurl/commit/74767c73b7df3428ae3674f9c26c62c0c64d251b))
+* move requests under &lt;collection&gt;/requests ([15a2d57](https://github.com/msegoviadev/termurl/commit/15a2d57cac5b76eed20304e6d37439ec3278fe83))
+* run the request queue with enter and clear it with shift-tab ([faabd4e](https://github.com/msegoviadev/termurl/commit/faabd4edf3375fe7a8e9ebb3f0de98b5ffe1e60a))
+* show flow names in the history list ([c291f04](https://github.com/msegoviadev/termurl/commit/c291f042020c2cac81c6eae407fab45bb62056e2))
+* unify requests/flows list styling and create input ([46bec0c](https://github.com/msegoviadev/termurl/commit/46bec0c7b6b9a661b16f4c4735fcd52e80226997))
+
+
+### Bug Fixes
+
+* make pane divider resize drag reliable and show a resize cursor ([957d0ee](https://github.com/msegoviadev/termurl/commit/957d0ee7ef4dc5977feae0b90a48b8d0614a874f))
+* reflow history day rules when the list width changes ([eec6e1e](https://github.com/msegoviadev/termurl/commit/eec6e1e95f21d10cfbc25eff9adc2075fdefa1e5))
+
 ## [0.4.0](https://github.com/msegoviadev/termurl/compare/v0.3.0...v0.4.0) (2026-09-13)
 
 
