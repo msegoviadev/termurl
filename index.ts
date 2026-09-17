@@ -1139,6 +1139,10 @@ type Pane = "list" | "editor" | "response";
 let pane: Pane = "list";
 let insert = false;
 let pending: string | null = null;
+// Pending `f`/`F`/`t`/`T` motion waiting for its target character, mirroring the
+// two-keystroke char search in vim. Kept separate from `pending` because the
+// operator keys (`d`/`c`/`y`) and this prefix share the same keypress slot.
+let charSearch: string | null = null;
 let visual = false;
 let visualAnchor = 0;
 let visualAnchorOffset = 0;
@@ -3653,6 +3657,7 @@ function clearVisual() {
   visual = false;
   visualKind = null;
   visualTarget = null;
+  charSearch = null;
   syncModeTitles();
 }
 
@@ -3745,6 +3750,7 @@ function setStatus() {
     (last ? ` · last: ${last[0]} ${last[1] === "ok" ? "✓" : "✗"}` : "") +
     (statusMsg ? ` · ${statusMsg}` : "") +
     (pending ? ` · ${pending}` : "") +
+    (charSearch ? ` · ${charSearch}` : "") +
     "   [?] help";
 }
 
@@ -3934,6 +3940,7 @@ async function runNamedFlow(flow: Flow, surface: RunSurface = "requests") {
 function enterInsert() {
   insert = true;
   pending = null;
+  charSearch = null;
   syncModeTitles();
   setStatus();
 }
@@ -3941,6 +3948,7 @@ function enterInsert() {
 function leaveInsert() {
   insert = false;
   pending = null;
+  charSearch = null;
   syncModeTitles();
   setStatus();
 }
@@ -3967,6 +3975,7 @@ function updateVisualSelection(target: TextareaRenderable) {
 
 function enterVisual(target: TextareaRenderable, kind: "char" | "line") {
   pending = null;
+  charSearch = null;
   visual = true;
   visualKind = kind;
   visualTarget = target;
@@ -3976,6 +3985,31 @@ function enterVisual(target: TextareaRenderable, kind: "char" | "line") {
   updateVisualSelection(target);
   syncModeTitles();
   setStatus();
+}
+
+// Resolves a pending `f`/`F`/`t`/`T` against the keypress that carries the
+// target character. Searches stay inside the current line, matching vim's
+// line-scoped char search, so `0f=lD` and `T=D` work on a KEY=value entry.
+function applyCharSearch(target: TextareaRenderable, key: KeyEvent): boolean {
+  if (!charSearch) return false;
+  const motion = charSearch;
+  charSearch = null;
+  const seq = key.sequence;
+  if (key.name === "escape" || !seq || seq.length !== 1 || key.ctrl || key.meta || key.option) return true;
+  const eb = target.editBuffer;
+  const { row, col } = eb.getCursorPosition();
+  const start = eb.getLineStartOffset(row);
+  const end = row + 1 < eb.getLineCount() ? eb.getLineStartOffset(row + 1) : target.plainText.length;
+  const line = eb.getTextRange(start, end).replace(/\n$/, "");
+  const forward = motion === "f" || motion === "t";
+  const index = forward ? line.indexOf(seq, col + 1) : col > 0 ? line.lastIndexOf(seq, col - 1) : -1;
+  if (index < 0) return true;
+  let targetCol = index;
+  if (motion === "t") targetCol = index - 1;
+  else if (motion === "T") targetCol = index + 1;
+  targetCol = Math.max(0, Math.min(targetCol, Math.max(0, line.length - 1)));
+  eb.setCursor(row, targetCol);
+  return true;
 }
 
 function applyVimMotion(target: TextareaRenderable, k: string, key: KeyEvent): boolean {
@@ -3999,15 +4033,16 @@ function applyVimMotion(target: TextareaRenderable, k: string, key: KeyEvent): b
   if (k === "J" || (k === "j" && shift)) jumpLines(1);
   else if (k === "K" || (k === "k" && shift)) jumpLines(-1);
   else if (k === "H" || (k === "h" && shift)) firstNonBlank();
-  else if (k === "L" || (k === "l" && shift)) { const e = eb.getEOL(); eb.setCursor(e.row, e.col); }
+  else if (k === "L" || (k === "l" && shift)) { const e = eb.getEOL(); eb.setCursor(e.row, Math.max(0, e.col - 1)); }
   else if (k === "h") eb.moveCursorLeft();
   else if (k === "l") eb.moveCursorRight();
   else if (k === "j") eb.moveCursorDown();
   else if (k === "k") eb.moveCursorUp();
   else if (k === "w") { const c = eb.getNextWordBoundary(); eb.setCursor(c.row, c.col); }
   else if (k === "b") { const c = eb.getPrevWordBoundary(); eb.setCursor(c.row, c.col); }
+  else if (k === "f" || k === "F" || k === "t" || k === "T") charSearch = shift ? k.toUpperCase() : k;
   else if (k === "0") eb.setCursor(eb.getCursorPosition().row, 0);
-  else if (k === "$" || (k === "4" && shift)) { const e = eb.getEOL(); eb.setCursor(e.row, e.col); }
+  else if (k === "$" || (k === "4" && shift)) { const e = eb.getEOL(); eb.setCursor(e.row, Math.max(0, e.col - 1)); }
   else if (k === "G" || (k === "g" && shift)) eb.gotoLine(eb.getLineCount() - 1);
   else return false;
   return true;
@@ -4064,6 +4099,14 @@ function vimNormal(k: string, key: KeyEvent, target: TextareaRenderable = editor
     statusMsg = `yanked line (${copyToClipboard(renderer, line)})`;
   };
 
+  if (charSearch) {
+    applyCharSearch(target, key);
+    if (visual && visualTarget === target) updateVisualSelection(target);
+    ensureCursorVisible(target);
+    setStatus();
+    return;
+  }
+
   if (visual && visualTarget === target) {
     moveVisual(target, k, key);
     return;
@@ -4078,12 +4121,12 @@ function vimNormal(k: string, key: KeyEvent, target: TextareaRenderable = editor
     const p = pending;
     pending = null;
     if (p === "g" && k === "g") { eb.setCursor(0, 0); ensureCursorVisible(target); }
-    else if (p === "y" && k === "y") yankLine();
-    else if (!readOnly && p === "d" && k === "d") {
+    else if (p === "y" && k === "y" && !shift) yankLine();
+    else if (!readOnly && p === "d" && k === "d" && !shift) {
       const { row } = eb.getCursorPosition();
       register = eb.getTextRange(eb.getLineStartOffset(row), eb.getLineStartOffset(row + 1));
       eb.deleteLine();
-    } else if (!readOnly && p === "c" && k === "c") {
+    } else if (!readOnly && p === "c" && k === "c" && !shift) {
       const { row } = eb.getCursorPosition();
       register = eb.getTextRange(eb.getLineStartOffset(row), eb.getLineStartOffset(row + 1));
       eb.deleteLine();
@@ -4102,7 +4145,7 @@ function vimNormal(k: string, key: KeyEvent, target: TextareaRenderable = editor
   else if (!readOnly && k === "o" && !shift) { const e = eb.getEOL(); eb.setCursor(e.row, e.col); startInsert(); eb.newLine(); }
   else if (!readOnly && (k === "O" || (k === "o" && shift))) { eb.setCursor(eb.getCursorPosition().row, 0); startInsert(); eb.newLine(); eb.moveCursorUp(); }
   else if (!applyVimMotion(target, k, key)) {
-    if (k === "g" || k === "y" || (!readOnly && (k === "d" || k === "c"))) pending = k;
+    if (k === "g" || (!shift && (k === "y" || (!readOnly && (k === "d" || k === "c"))))) pending = k;
     else if (k === "Y" || (k === "y" && shift)) {
       register = target.plainText;
       statusMsg = `yanked whole buffer (${copyToClipboard(renderer, register)})`;
@@ -4146,6 +4189,7 @@ function saveEditor() {
 function enterCommandLine() {
   commandBuffer = "";
   pending = null;
+  charSearch = null;
   setStatus();
 }
 
@@ -4280,6 +4324,7 @@ const VIM_MOVE: [string, string][] = [
   ["J / K", "quarter page down / up"],
   ["H / L", "first non-blank / line end"],
   ["0 / $", "start / end of line"],
+  ["f / t / F / T", "find / till a character"],
   ["gg / G", "top / bottom"],
 ];
 
