@@ -1933,6 +1933,8 @@ function requestTitle(insertMode = false, visualMode = false): string {
 }
 
 function loadEditorEntry(req: Req, force = false) {
+  pending = null;
+  charSearch = null;
   const variant = currentVariant(req);
   if (!force && editorDirty() && editorEntry && editorEntry.reqName === req.name && editorEntry.variant === variant) {
     syncModeTitles();
@@ -2241,6 +2243,8 @@ function moveEnvironment(delta: number) {
 }
 
 function loadEnvironmentFile(force = false) {
+  pending = null;
+  charSearch = null;
   const name = environments[selectedEnvironment];
   if (!force && envDirty() && envLoadedName === name) {
     if (envPane === "list" && !envInsert) envDetailBox.title = envTitle("list");
@@ -2481,6 +2485,8 @@ function toggleFlowFolder(path: string, recursive = false) {
 }
 
 function loadFlowFile(force = false) {
+  pending = null;
+  charSearch = null;
   const flow = currentFlow();
   if (flow) {
     if (!force && flowDirty() && flowLoadedName === flow.name) {
@@ -3501,6 +3507,8 @@ function watchCollection() {
     watch(COLLECTION, { recursive: true }, () => {
       if (timer) clearTimeout(timer);
       timer = setTimeout(() => {
+        pending = null;
+        charSearch = null;
         envVariablesCache.clear();
         hurlFileCache.clear();
         flowCache.clear();
@@ -3658,6 +3666,7 @@ function clearVisual() {
   visualKind = null;
   visualTarget = null;
   charSearch = null;
+  pending = null;
   syncModeTitles();
 }
 
@@ -3723,8 +3732,8 @@ function refreshGutters() {
 
 function modeLabel(): string {
   if (appWindow === "history") return historyPane === "detail" ? (visual ? "VISUAL" : "RUN-DETAILS") : "HISTORY";
-  if (appWindow === "environments") return envInsert ? "ENV-INSERT" : envPane === "editor" ? "ENV-NORMAL" : "ENVIRONMENTS";
-  if (appWindow === "flows") return flowInsert ? "FLOW-INSERT" : flowPane === "editor" ? "FLOW-NORMAL" : flowPane === "response" ? "FLOW-RESPONSE" : "FLOWS";
+  if (appWindow === "environments") return envInsert ? "ENV-INSERT" : envPane === "editor" ? (visual ? "ENV-VISUAL" : "ENV-NORMAL") : "ENVIRONMENTS";
+  if (appWindow === "flows") return flowInsert ? "FLOW-INSERT" : flowPane === "editor" ? (visual ? "FLOW-VISUAL" : "FLOW-NORMAL") : flowPane === "response" ? (visual ? "FLOW-VISUAL" : "FLOW-RESPONSE") : "FLOWS";
   if (pane === "editor") return insert ? "INSERT" : visual ? "REQ-VISUAL" : "REQ-NORMAL";
   if (pane === "response" && visual) return "VISUAL";
   return pane.toUpperCase();
@@ -4012,6 +4021,68 @@ function applyCharSearch(target: TextareaRenderable, key: KeyEvent): boolean {
   return true;
 }
 
+// Toggles `#` comments across a row range, mirroring the nvim `<leader>/`
+// binding. All-or-nothing: uncomment only when every line is already
+// commented, otherwise comment. Blank lines get `# ` so the range stays even.
+// The whole range is written back with one `replaceText` so a single `u`
+// restores it, and the cursor/anchor columns are remapped so visual mode
+// survives the edit instead of being dropped.
+function toggleComment(target: TextareaRenderable, startRow: number, endRow: number) {
+  const eb = target.editBuffer;
+  const lineCount = eb.getLineCount();
+  const first = Math.max(0, Math.min(startRow, lineCount - 1));
+  const last = Math.max(first, Math.min(endRow, lineCount - 1));
+  const oldText = target.plainText;
+  const lineStart = (row: number) => eb.getLineStartOffset(row);
+  const startOffset = lineStart(first);
+  const endOffset = last + 1 < lineCount ? lineStart(last + 1) : oldText.length;
+  const lines = oldText.slice(startOffset, endOffset).split("\n");
+  const rowOf = (i: number) => first + i;
+  let allCommented = true;
+  for (let i = 0; i < lines.length; i++) {
+    if (rowOf(i) > last) break;
+    if (!/^\s*#/.test(lines[i])) { allCommented = false; break; }
+  }
+  const deltas: { indent: number; change: number }[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (rowOf(i) > last) { deltas.push({ indent: 0, change: 0 }); continue; }
+    const line = lines[i];
+    const indent = line.match(/^\s*/)?.[0].length ?? 0;
+    if (allCommented) {
+      const rest = line.slice(indent);
+      const remove = rest.startsWith("# ") ? 2 : 1;
+      lines[i] = line.slice(0, indent) + rest.slice(remove);
+      deltas.push({ indent, change: -remove });
+    } else if (/^\s*#/.test(line)) {
+      deltas.push({ indent, change: 0 });
+    } else {
+      lines[i] = line.slice(0, indent) + "# " + line.slice(indent);
+      deltas.push({ indent, change: 2 });
+    }
+  }
+  const newText = oldText.slice(0, startOffset) + lines.join("\n") + oldText.slice(endOffset);
+  const cursor = eb.getCursorPosition();
+  const anchorCol = visualAnchorOffset - lineStart(visualAnchor);
+  eb.replaceText(newText);
+  if (visual && visualTarget === target) {
+    const newLineLen = (row: number) => (row >= first && row <= last ? lines[row - first].length : 0);
+    const mapCol = (row: number, col: number) => {
+      if (row < first || row > last) return col;
+      const delta = deltas[row - first];
+      if (delta.change > 0) return col >= delta.indent ? col + delta.change : col;
+      if (delta.change < 0) return col > delta.indent ? Math.max(delta.indent, col + delta.change) : col;
+      return col;
+    };
+    eb.setCursor(cursor.row, Math.min(mapCol(cursor.row, cursor.col), newLineLen(cursor.row)));
+    visualAnchorOffset = eb.getLineStartOffset(visualAnchor) + Math.min(mapCol(visualAnchor, anchorCol), newLineLen(visualAnchor));
+    updateVisualSelection(target);
+  } else {
+    const col = lines[0].search(/\S/);
+    eb.setCursor(first, col < 0 ? 0 : col);
+  }
+  ensureCursorVisible(target);
+}
+
 function applyVimMotion(target: TextareaRenderable, k: string, key: KeyEvent): boolean {
   const eb = target.editBuffer;
   const shift = key.shift;
@@ -4048,7 +4119,7 @@ function applyVimMotion(target: TextareaRenderable, k: string, key: KeyEvent): b
   return true;
 }
 
-function moveVisual(target: TextareaRenderable, k: string, key: KeyEvent): boolean {
+function moveVisual(target: TextareaRenderable, k: string, key: KeyEvent, readOnly = false): boolean {
   const eb = target.editBuffer;
   if (k === "escape") {
     clearVisual();
@@ -4062,6 +4133,9 @@ function moveVisual(target: TextareaRenderable, k: string, key: KeyEvent): boole
       eb.setCursor(0, 0);
       ensureCursorVisible(target);
       updateVisualSelection(target);
+    } else if (p === "space" && k === "/" && !readOnly) {
+      const row = eb.getCursorPosition().row;
+      toggleComment(target, Math.min(visualAnchor, row), Math.max(visualAnchor, row));
     }
     setStatus();
     return true;
@@ -4074,6 +4148,10 @@ function moveVisual(target: TextareaRenderable, k: string, key: KeyEvent): boole
   }
   if (k === "g") {
     pending = "g";
+    setStatus();
+    return true;
+  } else if (!readOnly && k === "space") {
+    pending = "space";
     setStatus();
     return true;
   } else if (k === "y") {
@@ -4108,7 +4186,7 @@ function vimNormal(k: string, key: KeyEvent, target: TextareaRenderable = editor
   }
 
   if (visual && visualTarget === target) {
-    moveVisual(target, k, key);
+    moveVisual(target, k, key, readOnly);
     return;
   }
 
@@ -4121,6 +4199,7 @@ function vimNormal(k: string, key: KeyEvent, target: TextareaRenderable = editor
     const p = pending;
     pending = null;
     if (p === "g" && k === "g") { eb.setCursor(0, 0); ensureCursorVisible(target); }
+    else if (p === "space" && k === "/" && !readOnly) { const { row } = eb.getCursorPosition(); toggleComment(target, row, row); }
     else if (p === "y" && k === "y" && !shift) yankLine();
     else if (!readOnly && p === "d" && k === "d" && !shift) {
       const { row } = eb.getCursorPosition();
@@ -4145,7 +4224,7 @@ function vimNormal(k: string, key: KeyEvent, target: TextareaRenderable = editor
   else if (!readOnly && k === "o" && !shift) { const e = eb.getEOL(); eb.setCursor(e.row, e.col); startInsert(); eb.newLine(); }
   else if (!readOnly && (k === "O" || (k === "o" && shift))) { eb.setCursor(eb.getCursorPosition().row, 0); startInsert(); eb.newLine(); eb.moveCursorUp(); }
   else if (!applyVimMotion(target, k, key)) {
-    if (k === "g" || (!shift && (k === "y" || (!readOnly && (k === "d" || k === "c"))))) pending = k;
+    if (k === "g" || (!readOnly && k === "space") || (!shift && (k === "y" || (!readOnly && (k === "d" || k === "c"))))) pending = k;
     else if (k === "Y" || (k === "y" && shift)) {
       register = target.plainText;
       statusMsg = `yanked whole buffer (${copyToClipboard(renderer, register)})`;
@@ -4338,6 +4417,7 @@ const VIM_EDIT: [string, string][] = [
   ["cc / C", "change line / to end of line"],
   ["yy / Y", "yank line / yank whole buffer"],
   ["p", "paste"],
+  ["space /", "toggle comment (line / selection)"],
   ["u / ctrl-r", "undo / redo"],
 ];
 
@@ -4496,6 +4576,8 @@ function hideHelp() {
 }
 function showHelp() {
   pendingDelete = null;
+  pending = null;
+  charSearch = null;
   helpVisible = true;
   helpLegend.content = renderHelpLegend();
   helpLegend.visible = helpContext() === "list";
@@ -4624,6 +4706,7 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
     if (envPane === "editor") {
       if (key.ctrl && k === "s") { saveEnvironmentFile(); return; }
       if (key.ctrl && k === "h") { setEnvPane("list"); return; }
+      if (visual && k === "escape") { clearVisual(); setStatus(); return; }
       if (k === "escape") { setEnvPane("list"); return; }
       if (!visual && (k === ":" || (k === ";" && key.shift))) { enterCommandLine(); return; }
       vimNormal(k, key, envDetail, false, "environment");
@@ -4658,6 +4741,7 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
       if (key.ctrl && k === "a") { appendStepToFlow(); return; }
       if (key.ctrl && k === "f") { const flow = currentFlow(); if (flow) void runNamedFlow(flow, "flows"); return; }
       if ((k === "enter" || k === "return") && key.shift) { const flow = currentFlow(); if (flow) void runNamedFlow(flow, "flows"); return; }
+      if (visual && k === "escape") { clearVisual(); setStatus(); return; }
       if (k === "escape") { setFlowPane("list"); return; }
       if (!visual && (k === ":" || (k === ";" && key.shift))) { enterCommandLine(); return; }
       vimNormal(k, key, flowDetail, false, "flow");
@@ -4665,6 +4749,7 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
     }
     if (flowPane === "response") {
       if (key.ctrl && k === "h") { setFlowPane("editor"); return; }
+      if (visual && k === "escape") { clearVisual(); setStatus(); return; }
       if (k === "escape") { setFlowPane("list"); return; }
       if (!visual && (k === ":" || (k === ";" && key.shift))) { enterCommandLine(); return; }
       if (k === "s") { statusMsg = saveLastBodies(); setStatus(); return; }
@@ -4740,8 +4825,8 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
     if (visual && k === "escape") { clearVisual(); setStatus(); return; }
     if (k === "escape") { setPane("list"); return; }
     if (!visual && (k === ":" || (k === ";" && key.shift))) { enterCommandLine(); return; }
-    if (k === "[") { cycleVariant(-1); return; }
-    if (k === "]") { cycleVariant(1); return; }
+    if (!visual && k === "[") { cycleVariant(-1); return; }
+    if (!visual && k === "]") { cycleVariant(1); return; }
     vimNormal(k, key);
     return;
   }
