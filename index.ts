@@ -4449,6 +4449,7 @@ const PANE_HELP: Record<string, [string, string][]> = {
     ...VIM_MOVE,
     ...VIM_EDIT,
     ["[ / ]", "previous / next variant"],
+    ["tab / shift-tab", "next / previous variant"],
     ["ctrl-s / :w", "save"],
     [":wq / :x", "save and close pane"],
     [":q / :q!", "close pane (bang discards changes)"],
@@ -4827,6 +4828,7 @@ renderer.keyInput.on("keypress", (key: KeyEvent) => {
     if (!visual && (k === ":" || (k === ";" && key.shift))) { enterCommandLine(); return; }
     if (!visual && k === "[") { cycleVariant(-1); return; }
     if (!visual && k === "]") { cycleVariant(1); return; }
+    if (!visual && k === "tab") { cycleVariant(key.shift ? -1 : 1); return; }
     vimNormal(k, key);
     return;
   }
