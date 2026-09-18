@@ -2,6 +2,15 @@
 
 All notable changes to termurl are documented here.
 
+## [0.7.0](https://github.com/msegoviadev/termurl/compare/v0.6.0...v0.7.0) (2026-09-17)
+
+
+### Features
+
+* add f/F/t/T char-search motions and fix shifted operator dispatch ([3c848ab](https://github.com/msegoviadev/termurl/commit/3c848ab63b78739e818524806ccdc26dc00137c4))
+* cycle request variants with tab in the editor ([d54aa9b](https://github.com/msegoviadev/termurl/commit/d54aa9b55651aed3c02080a93b90067f137f9646))
+* toggle comments with space / in the editors ([cdcc164](https://github.com/msegoviadev/termurl/commit/cdcc164b985769800cfe879827430e2570c85942))
+
 ## [0.6.0](https://github.com/msegoviadev/termurl/compare/v0.5.0...v0.6.0) (2026-09-14)
 
 
